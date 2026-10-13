@@ -1,0 +1,1572 @@
+//! Workspace build-tooling binary. See `cargo xtask --help`.
+//!
+//! Subcommands:
+//! - `regenerate-trace-fixture` — drives a real Chromium session via
+//!   `playwright-rs` and writes the resulting `.trace.zip` into
+//!   `crates/playwright-rs-trace/tests/fixtures/`, which downstream
+//!   parser tests consume.
+//! - `verify-agent-docs` — extracts ` ```rust,no_run ` code blocks
+//!   from `docs/agent/CLAUDE_SNIPPET.md` and
+//!   `skills/playwright-rs-usage/SKILL.md`, then runs
+//!   `cargo check` against them so they can't silently drift from the
+//!   crate API. Then asserts the shipped skill still *names* every
+//!   API-gating cargo feature and browser engine, so a capability
+//!   can't ship undocumented — the compile check only proves the code
+//!   the skill does show is valid, never that something is missing.
+//! - `verify-site-snippets` — wraps each `crates/site/snippets/*.rs`
+//!   fragment shown on the landing page in a binding prelude and runs
+//!   `cargo check`, so the site can't advertise code that doesn't
+//!   compile.
+//! - `verify-driver-version` — checks that every source/CI reference to
+//!   the bundled Playwright version (rustdoc/example install hints,
+//!   workflow cache keys) matches `PLAYWRIGHT_VERSION` in
+//!   `crates/playwright/build.rs`. The README is excluded on purpose.
+//! - `verify-changelog-links` — checks that each per-crate CHANGELOG's
+//!   reference-link footer matches its version headings, so a release
+//!   can't leave `[X.Y.Z]` rendering as literal text.
+//! - `sync-protocol-spec` — vendors the pinned driver's protocol spec
+//!   into `protocol-spec/` so a driver bump shows its wire-contract
+//!   delta as a diff; `--check` verifies that copy offline and is what
+//!   CI and pre-commit run.
+
+use anyhow::{Context as _, Result, bail};
+use axum::Router;
+use axum::routing::get;
+use clap::Parser;
+use playwright_rs::Playwright;
+use playwright_rs::protocol::{TracingStartOptions, TracingStopOptions};
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
+/// `cargo xtask <subcommand>`
+#[derive(Parser)]
+#[command(name = "xtask", about = "Workspace build tooling for playwright-rust")]
+enum Cmd {
+    /// Regenerate the deterministic trace fixture used by
+    /// playwright-rs-trace's parse tests.
+    RegenerateTraceFixture {
+        /// Output zip path (defaults to the fixture location).
+        #[arg(
+            long,
+            default_value = "crates/playwright-rs-trace/tests/fixtures/basic.trace.zip"
+        )]
+        out: PathBuf,
+    },
+    /// Compile-check the `rust,no_run` blocks in the agent-integration
+    /// docs (`docs/agent/CLAUDE_SNIPPET.md` and
+    /// `skills/playwright-rs-usage/SKILL.md`) so they can't
+    /// drift from the real `playwright-rs` API.
+    VerifyAgentDocs,
+    /// Compile-check the Rust snippets rendered on the landing page
+    /// (`crates/site/snippets/*.rs`) so the site can't advertise code
+    /// that doesn't compile against the real `playwright-rs` API.
+    VerifySiteSnippets,
+    /// Verify that every source/CI reference to the bundled Playwright
+    /// version (rustdoc/example install hints, workflow cache keys)
+    /// matches the single source of truth, `PLAYWRIGHT_VERSION` in
+    /// `crates/playwright/build.rs`. The README is intentionally excluded:
+    /// it tracks the latest crates.io release, not the in-tree version.
+    VerifyDriverVersion,
+    /// Verify that every per-crate CHANGELOG's reference-link footer
+    /// agrees with its version headings: every `## [X.Y.Z]` has a
+    /// matching `[X.Y.Z]:` definition, the compare links chain to the
+    /// preceding release, and `[Unreleased]` compares from the latest
+    /// one. These footers are maintained by hand at release time and
+    /// had drifted silently across three releases.
+    VerifyChangelogLinks,
+    /// Vendor the protocol spec of the pinned driver into `protocol-spec/`,
+    /// so a driver bump shows its wire-contract delta as a reviewable diff
+    /// rather than as behavior nobody notices. The driver's validator drops
+    /// parameters it does not recognize instead of rejecting them, so a
+    /// renamed key is silent: Playwright 1.63 renamed every `tracingStart`
+    /// capture parameter, and traces recorded with the old spellings
+    /// contained no snapshots and no timeline, with no error anywhere.
+    SyncProtocolSpec {
+        /// Verify the vendored copy is the pinned driver's, without
+        /// fetching. This is the CI/pre-commit form.
+        #[arg(long)]
+        check: bool,
+    },
+    /// Verify that every protocol method name the crate sends is a command
+    /// the vendored spec defines. The driver rejects an unknown method, the
+    /// crate mostly discards that rejection, and the caller sees a timeout
+    /// or nothing: `resolveLocatorHandler`, `path` and `connectToServer`
+    /// all shipped that way, each for several releases.
+    VerifyProtocolMethods,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    match Cmd::parse() {
+        Cmd::RegenerateTraceFixture { out } => regenerate_trace_fixture(&out).await,
+        Cmd::VerifyAgentDocs => verify_agent_docs(),
+        Cmd::VerifySiteSnippets => verify_site_snippets(),
+        Cmd::VerifyDriverVersion => verify_driver_version(),
+        Cmd::VerifyChangelogLinks => verify_changelog_links(),
+        Cmd::SyncProtocolSpec { check } => sync_protocol_spec(check),
+        Cmd::VerifyProtocolMethods => verify_protocol_methods(),
+    }
+}
+
+async fn regenerate_trace_fixture(out: &Path) -> Result<()> {
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create parent dir {}", parent.display()))?;
+    }
+
+    // Local server so the navigation produces a `resource-snapshot`
+    // in `trace.network` — `data:` URLs don't.
+    let app = Router::new().route(
+        "/",
+        get(|| async { axum::response::Html(FIXTURE_PAGE_HTML) }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("bind fixture server")?;
+    let addr = listener.local_addr().context("local_addr")?;
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let pw = Playwright::launch()
+        .await
+        .context("launch playwright server")?;
+    let browser = pw.chromium().launch().await.context("launch chromium")?;
+    let context = browser.new_context().await.context("new browser context")?;
+    let tracing = context.tracing().await.context("get tracing handle")?;
+
+    tracing
+        .start(Some(
+            TracingStartOptions::default()
+                .name("fixture")
+                .screenshots(true)
+                .snapshots(true),
+        ))
+        .await
+        .context("start tracing")?;
+
+    let page = context.new_page().await.context("new page")?;
+
+    page.goto(&format!("http://{addr}/"), None)
+        .await
+        .context("goto local fixture server")?;
+
+    page.locator("#b")
+        .click(None)
+        .await
+        .context("click button")?;
+
+    // Brief pause so the console event is recorded before stop.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let out_str = out.to_string_lossy().into_owned();
+    tracing
+        .stop(Some(TracingStopOptions::default().path(out_str.clone())))
+        .await
+        .context("stop tracing")?;
+
+    browser.close().await.context("close browser")?;
+    server.abort();
+
+    println!("wrote {}", out.display());
+    Ok(())
+}
+
+const FIXTURE_PAGE_HTML: &str = r#"<!doctype html>
+<html>
+<body>
+<button id="b" onclick='console.log("hi")'>X</button>
+</body>
+</html>"#;
+
+/// Walk the agent-doc markdown files, extract every ` ```rust,no_run `
+/// block, write them into a throwaway crate under
+/// `target/agent-docs-verify/`, and run `cargo check` against it. If
+/// the snippets drift from the real `playwright-rs` API, this fails.
+fn verify_agent_docs() -> Result<()> {
+    let workspace_root = workspace_root();
+    let inputs = [
+        workspace_root.join("docs/agent/CLAUDE_SNIPPET.md"),
+        workspace_root.join("skills/playwright-rs-usage/SKILL.md"),
+    ];
+
+    let mut blocks: Vec<ExtractedBlock> = Vec::new();
+    for path in &inputs {
+        let content =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        blocks.extend(extract_no_run_blocks(path, &content));
+    }
+
+    if blocks.is_empty() {
+        // Still run the capability guard: it reads the skill directly and
+        // must not be skipped just because the prose currently carries no
+        // compilable block.
+        println!("verify-agent-docs: no `rust,no_run` blocks found — nothing to compile");
+        return verify_skill_covers_capabilities(&workspace_root);
+    }
+
+    let check_dir = workspace_root.join("target/agent-docs-verify");
+    std::fs::create_dir_all(check_dir.join("tests"))
+        .with_context(|| format!("create {}", check_dir.display()))?;
+
+    let playwright_path = workspace_root.join("crates/playwright");
+    let cargo_toml = format!(
+        r#"# Generated by `cargo xtask verify-agent-docs`. Do not edit.
+[workspace]
+
+[package]
+name = "agent-docs-verify"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1"
+tokio = {{ version = "1", features = ["macros", "rt-multi-thread"] }}
+playwright-rs = {{ path = {playwright_path:?} }}
+"#,
+        playwright_path = playwright_path.display().to_string(),
+    );
+    std::fs::write(check_dir.join("Cargo.toml"), cargo_toml).context("write Cargo.toml")?;
+
+    let mut tests_rs = String::from(
+        "// Generated by `cargo xtask verify-agent-docs`. Do not edit.\n\
+         #![allow(unused_imports, unused_variables, dead_code)]\n\n",
+    );
+    for block in &blocks {
+        let rel = block
+            .source
+            .strip_prefix(&workspace_root)
+            .unwrap_or(&block.source);
+        tests_rs.push_str(&format!(
+            "// === {} (line {}) ===\n",
+            rel.display(),
+            block.start_line
+        ));
+        tests_rs.push_str(&block.code);
+        tests_rs.push_str("\n\n");
+    }
+    std::fs::write(check_dir.join("tests/agent_docs.rs"), tests_rs)
+        .context("write tests/agent_docs.rs")?;
+
+    let status = std::process::Command::new(env!("CARGO"))
+        .args(["check", "--tests", "--manifest-path"])
+        .arg(check_dir.join("Cargo.toml"))
+        .status()
+        .context("invoke cargo check")?;
+
+    if !status.success() {
+        bail!(
+            "verify-agent-docs: cargo check failed — agent-doc snippets have drifted from the playwright-rs API. \
+             See output above; offending source lines are noted in `target/agent-docs-verify/tests/agent_docs.rs`."
+        );
+    }
+
+    println!(
+        "verify-agent-docs: {} block(s) compile cleanly against playwright-rs",
+        blocks.len()
+    );
+
+    verify_skill_covers_capabilities(&workspace_root)?;
+    Ok(())
+}
+
+/// Cargo features that gate build/transport configuration rather than API
+/// surface. An agent writing test code never picks between these, so the
+/// skill is not required to name them.
+///
+/// This list is the reason the check is worth having: anything *not* named
+/// here must be documented, so a new capability cannot ship without the
+/// skill mentioning it. Adding a feature here is a deliberate act, not a
+/// default.
+const NON_API_FEATURES: &[&str] = &[
+    "native-tls",
+    "rustls-tls-native-roots",
+    "rustls-tls-webpki-roots",
+    "ring",
+    "aws-lc",
+];
+
+/// Assert the shipped skill still names every capability the crate exposes.
+///
+/// The compile check above proves the skill's code is *valid*; it says
+/// nothing about what the skill left out. This is the other half: each
+/// API-gating cargo feature and each browser engine must appear somewhere in
+/// the text, so shipping one without documenting it fails the build.
+///
+/// Neither half checks that the surrounding prose is *accurate*. That
+/// residue is real and is stated in the skill itself.
+fn verify_skill_covers_capabilities(workspace_root: &Path) -> Result<()> {
+    let skill_path = workspace_root.join("skills/playwright-rs-usage/SKILL.md");
+    let skill = std::fs::read_to_string(&skill_path)
+        .with_context(|| format!("read {}", skill_path.display()))?;
+
+    let manifest_path = workspace_root.join("crates/playwright/Cargo.toml");
+    let manifest = std::fs::read_to_string(&manifest_path)
+        .with_context(|| format!("read {}", manifest_path.display()))?;
+
+    let mut missing: Vec<String> = Vec::new();
+
+    // Both extractors are text scrapers, so they fail open: if a rename or a
+    // rustfmt rewrap stops them matching, an empty list would sail through
+    // and print success. Refuse to pass on nothing found.
+    let features = feature_names(&manifest);
+    if features.is_empty() {
+        bail!(
+            "verify-agent-docs: found no features in {} -- the [features] parser has drifted, \
+             not the docs.",
+            manifest_path.display()
+        );
+    }
+
+    for feature in features {
+        if feature == "default" || NON_API_FEATURES.contains(&feature.as_str()) {
+            continue;
+        }
+        if !mentions(&skill, &feature) {
+            missing.push(format!("cargo feature `{feature}`"));
+        }
+    }
+
+    let playwright_rs = workspace_root.join("crates/playwright/src/protocol/playwright.rs");
+    let engines_src = std::fs::read_to_string(&playwright_rs)
+        .with_context(|| format!("read {}", playwright_rs.display()))?;
+    let engines = browser_engines(&engines_src);
+    if engines.is_empty() {
+        bail!(
+            "verify-agent-docs: found no browser engines in {} -- the accessor parser has \
+             drifted, not the docs.",
+            playwright_rs.display()
+        );
+    }
+    for engine in engines {
+        if !mentions(&skill, &engine) {
+            missing.push(format!("browser engine `{engine}`"));
+        }
+    }
+
+    if !missing.is_empty() {
+        bail!(
+            "verify-agent-docs: {} shipped capability/capabilities are absent from {}:\n  {}\n\
+             Document them, or -- for a build/transport knob an agent never chooses -- \
+             add the feature to NON_API_FEATURES in crates/xtask/src/main.rs.",
+            missing.len(),
+            skill_path
+                .strip_prefix(workspace_root)
+                .unwrap_or(&skill_path)
+                .display(),
+            missing.join("\n  "),
+        );
+    }
+
+    println!("verify-agent-docs: skill names every API-gating feature and browser engine");
+    Ok(())
+}
+
+/// Whether `needle` appears in `haystack` as a whole token.
+///
+/// A plain `contains` is wrong here: the `cli` feature would match "click"
+/// and "client" and silently pass, which it did on the first run of this
+/// check. Identifier characters on either side disqualify a hit.
+fn mentions(haystack: &str, needle: &str) -> bool {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '-' || c == '_';
+    haystack.match_indices(needle).any(|(i, m)| {
+        let before = haystack[..i].chars().next_back();
+        let after = haystack[i + m.len()..].chars().next();
+        !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
+    })
+}
+
+/// Feature names from a manifest's `[features]` table.
+fn feature_names(manifest: &str) -> Vec<String> {
+    manifest
+        .lines()
+        .skip_while(|l| l.trim() != "[features]")
+        .skip(1)
+        .take_while(|l| !l.trim_start().starts_with('['))
+        .filter_map(|l| l.split_once('=').map(|(name, _)| name.trim()))
+        .filter(|name| !name.is_empty() && !name.starts_with('#'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Browser-engine accessors on `Playwright` (`pub fn x(&self) -> &BrowserType`).
+fn browser_engines(source: &str) -> Vec<String> {
+    source
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim();
+            let rest = l.strip_prefix("pub fn ")?;
+            if !rest.contains("-> &BrowserType") {
+                return None;
+            }
+            rest.split_once('(').map(|(name, _)| name.to_string())
+        })
+        .collect()
+}
+
+fn verify_site_snippets() -> Result<()> {
+    let workspace_root = workspace_root();
+    let snippets_dir = workspace_root.join("crates/site/snippets");
+
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(&snippets_dir)
+        .with_context(|| format!("read {}", snippets_dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "rs"))
+        .collect();
+    paths.sort();
+
+    if paths.is_empty() {
+        println!("verify-site-snippets: no .rs snippets found — nothing to check");
+        return Ok(());
+    }
+
+    let check_dir = workspace_root.join("target/site-snippets-verify");
+    std::fs::create_dir_all(check_dir.join("tests"))
+        .with_context(|| format!("create {}", check_dir.display()))?;
+
+    let playwright_path = workspace_root.join("crates/playwright");
+    let cargo_toml = format!(
+        r#"# Generated by `cargo xtask verify-site-snippets`. Do not edit.
+[workspace]
+
+[package]
+name = "site-snippets-verify"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+serde_json = "1"
+tokio = {{ version = "1", features = ["macros", "rt-multi-thread"] }}
+tracing-subscriber = "0.3"
+playwright-rs = {{ path = {playwright_path:?} }}
+# The in-process serving snippets build an axum app over a static bundle.
+axum = "0.8"
+tower-http = {{ version = "0.7", features = ["fs"] }}
+"#,
+        playwright_path = playwright_path.display().to_string(),
+    );
+    std::fs::write(check_dir.join("Cargo.toml"), cargo_toml).context("write Cargo.toml")?;
+
+    // Each snippet is a fragment shown on the landing page, not a full
+    // program. Wrap it in an async fn whose prelude binds everything the
+    // fragments assume to be in scope (pw / page / url / context / cards /
+    // app).
+    let mut tests_rs = String::from(
+        "// Generated by `cargo xtask verify-site-snippets`. Do not edit.\n\
+         #![allow(unused_imports, unused_variables, unused_mut, dead_code)]\n\
+         use axum::{Json, Router, routing::get};\n\
+         use axum::http::{StatusCode, header::CONTENT_TYPE};\n\
+         use axum::response::IntoResponse;\n\
+         use std::sync::{Arc, Mutex};\n\
+         use playwright_rs::protocol::{Playwright, ScreenshotOptions, StorageStateOptions, Viewport};\n\
+         use playwright_rs::expect;\n\
+         use tower_http::services::ServeDir;\n\n",
+    );
+    for path in &paths {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("snippet")
+            .replace('-', "_");
+        let code =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let rel = path.strip_prefix(&workspace_root).unwrap_or(path);
+        tests_rs.push_str(&format!(
+            "// === {} ===\n\
+             async fn snippet_{stem}() -> std::result::Result<(), Box<dyn std::error::Error>> {{\n\
+             \x20   let pw = Playwright::launch().await?;\n\
+             \x20   let browser = pw.chromium().launch().await?;\n\
+             \x20   let context = browser.new_context().await?;\n\
+             \x20   let page = context.new_page().await?;\n\
+             \x20   let url = \"http://localhost:8080\";\n\
+             \x20   let cards: Vec<(&str, &str)> = Vec::new();\n\
+             \x20   let app: Router = Router::new();\n\
+             \x20   let backend: Arc<Mutex<Option<String>>> = Arc::default();\n\
+             \x20   {{\n",
+            rel.display(),
+        ));
+        for line in code.lines() {
+            tests_rs.push_str("        ");
+            tests_rs.push_str(line);
+            tests_rs.push('\n');
+        }
+        tests_rs.push_str("    }\n    Ok(())\n}\n\n");
+    }
+    std::fs::write(check_dir.join("tests/snippets.rs"), tests_rs)
+        .context("write tests/snippets.rs")?;
+
+    let status = std::process::Command::new(env!("CARGO"))
+        .args(["check", "--tests", "--manifest-path"])
+        .arg(check_dir.join("Cargo.toml"))
+        // Compile-only: never launches a browser, so skip the ~42 MB
+        // driver download in playwright-rs's build script.
+        .env("PLAYWRIGHT_SKIP_DRIVER_DOWNLOAD", "1")
+        .status()
+        .context("invoke cargo check")?;
+
+    if !status.success() {
+        bail!(
+            "verify-site-snippets: cargo check failed — a landing-page snippet has drifted from the \
+             playwright-rs API. See output above; sources are noted in \
+             `target/site-snippets-verify/tests/snippets.rs`."
+        );
+    }
+
+    println!(
+        "verify-site-snippets: {} snippet(s) compile cleanly against playwright-rs",
+        paths.len()
+    );
+    Ok(())
+}
+
+struct ExtractedBlock {
+    source: PathBuf,
+    start_line: usize,
+    code: String,
+}
+
+/// Parse fenced markdown code blocks tagged ` ```rust,no_run `. The
+/// closing fence (``` ``` ```) must match the opening; no nesting.
+fn extract_no_run_blocks(path: &Path, content: &str) -> Vec<ExtractedBlock> {
+    let mut blocks = Vec::new();
+    let mut in_block = false;
+    let mut start_line = 0usize;
+    let mut buf = String::new();
+
+    for (idx, line) in content.lines().enumerate() {
+        let lineno = idx + 1;
+        let trimmed = line.trim();
+        if !in_block {
+            // Match `rust,no_run` with optional trailing whitespace.
+            if trimmed == "```rust,no_run" {
+                in_block = true;
+                start_line = lineno + 1;
+                buf.clear();
+            }
+        } else if trimmed == "```" {
+            blocks.push(ExtractedBlock {
+                source: path.to_path_buf(),
+                start_line,
+                code: buf.clone(),
+            });
+            in_block = false;
+        } else {
+            buf.push_str(line);
+            buf.push('\n');
+        }
+    }
+
+    blocks
+}
+
+/// Parses `PLAYWRIGHT_VERSION` out of `crates/playwright/build.rs`, the single
+/// source of truth for the bundled driver version.
+fn read_driver_version(root: &Path) -> Result<String> {
+    read_version_const(
+        &root.join("crates/playwright/build.rs"),
+        "const PLAYWRIGHT_VERSION: &str = \"",
+    )
+}
+
+/// Parses `NODE_VERSION` out of the shared acquisition module, the single
+/// source of truth for the Node runtime the driver is assembled with.
+fn read_node_version(root: &Path) -> Result<String> {
+    read_version_const(
+        &root.join("crates/playwright/src/build_support/driver_urls.rs"),
+        "const NODE_VERSION: &str = \"",
+    )
+}
+
+fn read_version_const(path: &Path, marker: &str) -> Result<String> {
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let name = marker
+        .trim_start_matches("const ")
+        .split(':')
+        .next()
+        .unwrap_or(marker);
+    let start = content
+        .find(marker)
+        .with_context(|| format!("{name} constant not found in {}", path.display()))?
+        + marker.len();
+    let end = content[start..]
+        .find('"')
+        .with_context(|| format!("unterminated {name} string literal"))?
+        + start;
+    Ok(content[start..end].to_string())
+}
+
+/// Collects every `MAJOR.MINOR.PATCH` token that immediately follows `prefix`
+/// in `content` (e.g. `playwright@1.61.0` -> `1.61.0`).
+fn versions_after(content: &str, prefix: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = content;
+    while let Some(idx) = rest.find(prefix) {
+        rest = &rest[idx + prefix.len()..];
+        let ver: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        // A version never ends in a dot, so a trailing one is sentence
+        // punctuation the scan swallowed (`... against playwright@1.62.1.`).
+        let ver = ver.trim_end_matches('.');
+        if ver.contains('.') {
+            out.push(ver.to_string());
+        }
+    }
+    out
+}
+
+fn verify_driver_version() -> Result<()> {
+    let root = workspace_root();
+    let expected = read_driver_version(&root)?;
+
+    // (file, prefixes whose trailing version must equal `expected`). The README
+    // is deliberately absent: it mirrors the latest crates.io release, which may
+    // lag the in-tree (unreleased) driver version until the next release. Same
+    // reason for `hero.rs`'s `PLAYWRIGHT_RELEASED` — only its `PLAYWRIGHT_DEV`
+    // (which tracks main HEAD) is anchored below.
+    // Install guidance no longer pins `npx playwright@X.Y.Z` anywhere; the
+    // `playwright@` anchors that remain are claims about which driver a file
+    // was verified against, which rot the same way a stale install command did.
+    let targets: &[(&str, &[&str])] = &[
+        (
+            "crates/playwright-rs-trace/tests/parse_fixture.rs",
+            &["playwright@"],
+        ),
+        ("crates/playwright-rs-trace/src/lib.rs", &["playwright@"]),
+        ("crates/playwright/src/protocol/root.rs", &["playwright@"]),
+        (
+            ".github/workflows/test.yml",
+            &["pw-driver-", "playwright-browsers-"],
+        ),
+        (
+            ".github/workflows/release.yml",
+            &["pw-driver-", "playwright-browsers-"],
+        ),
+        (
+            ".github/workflows/pages.yml",
+            &["pw-driver-", "playwright-browsers-"],
+        ),
+        // Site dev-build driver badge + its e2e assertion, both tracking main
+        // HEAD. Anchored so `PLAYWRIGHT_RELEASED` (the published-release driver,
+        // which lags) is left out.
+        (
+            "crates/site/src/components/hero.rs",
+            &["PLAYWRIGHT_DEV: &str = \""],
+        ),
+        (
+            "crates/site-e2e/tests/landing_page.rs",
+            &["alt='Playwright "],
+        ),
+    ];
+
+    let mut drift = Vec::new();
+    let mut checked = 0usize;
+    for (rel, prefixes) in targets {
+        let content =
+            std::fs::read_to_string(root.join(rel)).with_context(|| format!("read {rel}"))?;
+        for prefix in *prefixes {
+            for found in versions_after(&content, prefix) {
+                checked += 1;
+                if found != expected {
+                    drift.push(format!("  {rel}: `{prefix}{found}` (expected {expected})"));
+                }
+            }
+        }
+    }
+
+    if !drift.is_empty() {
+        bail!(
+            "verify-driver-version: {} reference(s) disagree with build.rs \
+             PLAYWRIGHT_VERSION = {expected}:\n{}\n\
+             Bump them to {expected}. (The README is excluded on purpose — it \
+             tracks the published crates.io release.)",
+            drift.len(),
+            drift.join("\n"),
+        );
+    }
+
+    // The Node pin the driver is assembled with (ADR 0006). No cross-file
+    // drift targets yet — it lives only in driver_urls.rs — but a rename or
+    // malformed value must fail here loudly, because the weekly upstream
+    // check greps the constant to probe the nodejs.org download URL.
+    let node = read_node_version(&root)?;
+    if node.split('.').count() != 3 || node.split('.').any(|p| p.parse::<u32>().is_err()) {
+        bail!("verify-driver-version: NODE_VERSION = \"{node}\" is not a bare MAJOR.MINOR.PATCH");
+    }
+
+    println!(
+        "verify-driver-version: {checked} reference(s) match build.rs PLAYWRIGHT_VERSION = {expected}; NODE_VERSION = {node}"
+    );
+    Ok(())
+}
+
+const REPO_URL: &str = "https://github.com/padamson/playwright-rust";
+
+/// Each publishable crate's CHANGELOG and the git tag prefix its
+/// releases carry. The top-level `CHANGELOG.md` is an index, not a
+/// changelog, so it is deliberately absent.
+const CHANGELOGS: &[(&str, &str)] = &[
+    ("crates/playwright/CHANGELOG.md", "v"),
+    ("crates/playwright-rs-macros/CHANGELOG.md", "macros-v"),
+    ("crates/playwright-rs-trace/CHANGELOG.md", "trace-v"),
+];
+
+/// Version headings (`## [X]`) in document order — newest first, with
+/// `Unreleased` at the front.
+fn changelog_headings(content: &str) -> Vec<String> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix("## [")?;
+            let end = rest.find(']')?;
+            Some(rest[..end].to_string())
+        })
+        .collect()
+}
+
+/// Reference-style link definitions (`[X]: url`) as `(label, url)`.
+/// Only column-zero lines count, which is what distinguishes a
+/// definition from a heading or an inline link.
+fn changelog_link_defs(content: &str) -> Vec<(String, String)> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let rest = line.strip_prefix('[')?;
+            let end = rest.find("]: ")?;
+            Some((rest[..end].to_string(), rest[end + 3..].trim().to_string()))
+        })
+        .collect()
+}
+
+/// Cross-check one CHANGELOG's headings against its link footer,
+/// returning a human-readable problem per mismatch.
+///
+/// Four ways the footer can be wrong, all of which have actually
+/// happened here: a heading with no definition (renders as literal
+/// `[0.15.0]`), a definition with no heading, an `[Unreleased]` link
+/// still comparing from a superseded release, and a compare link that
+/// doesn't chain to the version below it.
+fn changelog_link_problems(content: &str, prefix: &str) -> Vec<String> {
+    let headings = changelog_headings(content);
+    let defs = changelog_link_defs(content);
+    let url_for = |label: &str| {
+        defs.iter()
+            .find(|(l, _)| l == label)
+            .map(|(_, u)| u.as_str())
+    };
+
+    let mut problems = Vec::new();
+
+    for heading in &headings {
+        if url_for(heading).is_none() {
+            problems.push(format!(
+                "`## [{heading}]` has no `[{heading}]:` link definition (renders as literal text)"
+            ));
+        }
+    }
+    for (label, _) in &defs {
+        if !headings.iter().any(|h| h == label) {
+            problems.push(format!(
+                "`[{label}]:` is defined but there is no `## [{label}]` heading"
+            ));
+        }
+    }
+
+    let mut mismatch = |label: &str, found: &str, want: String, why: &str| {
+        if found != want {
+            problems.push(format!(
+                "`[{label}]:` {why}\n       found: {found}\n    expected: {want}"
+            ));
+        }
+    };
+
+    let released: Vec<&String> = headings.iter().filter(|h| *h != "Unreleased").collect();
+
+    if let (Some(latest), Some(found)) = (released.first(), url_for("Unreleased")) {
+        mismatch(
+            "Unreleased",
+            found,
+            format!("{REPO_URL}/compare/{prefix}{latest}...HEAD"),
+            "should compare from the latest release",
+        );
+    }
+
+    // Each release compares against the one directly below it.
+    for pair in released.windows(2) {
+        let (newer, older) = (pair[0], pair[1]);
+        if let Some(found) = url_for(newer) {
+            mismatch(
+                newer,
+                found,
+                format!("{REPO_URL}/compare/{prefix}{older}...{prefix}{newer}"),
+                &format!("should compare against {older}"),
+            );
+        }
+    }
+
+    // The oldest release has nothing to compare against, so it points at
+    // its own tag instead.
+    if let Some(oldest) = released.last()
+        && let Some(found) = url_for(oldest)
+    {
+        mismatch(
+            oldest,
+            found,
+            format!("{REPO_URL}/releases/tag/{prefix}{oldest}"),
+            "is the oldest release, so it should point at its release tag",
+        );
+    }
+
+    problems
+}
+
+fn verify_changelog_links() -> Result<()> {
+    let root = workspace_root();
+    let mut failures = Vec::new();
+    let mut checked = 0usize;
+
+    for (rel, prefix) in CHANGELOGS {
+        let content =
+            std::fs::read_to_string(root.join(rel)).with_context(|| format!("read {rel}"))?;
+        checked += changelog_headings(&content).len();
+        for problem in changelog_link_problems(&content, prefix) {
+            failures.push(format!("  {rel}: {problem}"));
+        }
+    }
+
+    if !failures.is_empty() {
+        bail!(
+            "verify-changelog-links: {} problem(s):\n{}\n\n\
+             These footers are hand-maintained at release time — see the \
+             release-process skill, step 6.",
+            failures.len(),
+            failures.join("\n"),
+        );
+    }
+
+    println!(
+        "verify-changelog-links: {checked} heading(s) across {} CHANGELOGs have matching, correctly-chained links",
+        CHANGELOGS.len()
+    );
+    Ok(())
+}
+
+/// Where the pinned driver's protocol spec is vendored.
+const SPEC_DIR: &str = "protocol-spec";
+/// Records which driver the vendored spec was taken from.
+const SPEC_STAMP: &str = "protocol-spec/DRIVER_VERSION";
+/// Digest of every vendored file, so the offline check sees an edited or
+/// half-written tree rather than a plausible-looking one.
+const SPEC_MANIFEST: &str = "protocol-spec/MANIFEST";
+
+/// Vendor (or verify) the protocol spec of the pinned driver.
+fn sync_protocol_spec(check: bool) -> Result<()> {
+    let root = workspace_root();
+    let expected = read_driver_version(&root)?;
+    let dir = root.join(SPEC_DIR);
+
+    if check {
+        return check_protocol_spec(&root, &dir, &expected);
+    }
+
+    // Fetch everything before touching the tree: a mid-flight failure then
+    // leaves the vendored copy as it was, rather than a truncated spec the
+    // stamp still vouches for.
+    let files = fetch_spec_files(&expected)?;
+
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    for stale in spec_files(&dir)? {
+        std::fs::remove_file(&stale).with_context(|| format!("remove {}", stale.display()))?;
+    }
+    let mut manifest = String::new();
+    for (name, content) in &files {
+        std::fs::write(dir.join(name), content)
+            .with_context(|| format!("write {}", dir.join(name).display()))?;
+        manifest.push_str(&format!("{}  {name}\n", digest(content)));
+    }
+    std::fs::write(root.join(SPEC_MANIFEST), manifest)
+        .with_context(|| format!("write {SPEC_MANIFEST}"))?;
+    std::fs::write(root.join(SPEC_STAMP), format!("{expected}\n"))
+        .with_context(|| format!("write {SPEC_STAMP}"))?;
+
+    println!(
+        "sync-protocol-spec: vendored {} spec file(s) from driver {expected}. \
+         Review `git diff {SPEC_DIR}` before committing: a removed or renamed parameter \
+         is dropped silently by the driver.",
+        files.len()
+    );
+    Ok(())
+}
+
+/// Verify the vendored spec offline: the right driver, every file the
+/// manifest lists, unmodified, and nothing extra.
+fn check_protocol_spec(root: &Path, dir: &Path, expected: &str) -> Result<()> {
+    let stamp = root.join(SPEC_STAMP);
+    let found = std::fs::read_to_string(&stamp)
+        .with_context(|| {
+            format!(
+                "read {}; run `cargo xtask sync-protocol-spec` to vendor the spec",
+                stamp.display()
+            )
+        })?
+        .trim()
+        .to_string();
+    if found != expected {
+        bail!(
+            "verify-protocol-spec: the vendored protocol spec is from driver {found}, but \
+             build.rs pins {expected}. Run `cargo xtask sync-protocol-spec` and review the \
+             diff: a renamed parameter is dropped by the driver, not rejected."
+        );
+    }
+
+    let manifest = std::fs::read_to_string(root.join(SPEC_MANIFEST))
+        .with_context(|| format!("read {SPEC_MANIFEST}"))?;
+    let vendored: Vec<(String, Option<Vec<u8>>)> = spec_files(dir)?
+        .into_iter()
+        .map(|path| {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string();
+            (name, std::fs::read(&path).ok())
+        })
+        .collect();
+    let (listed, problems) = spec_problems(&manifest, &vendored)?;
+
+    if !problems.is_empty() {
+        bail!(
+            "verify-protocol-spec: the vendored spec does not match {SPEC_MANIFEST}:\n  {}\n\n\
+             It is vendored verbatim from upstream; re-run `cargo xtask sync-protocol-spec`.",
+            problems.join("\n  ")
+        );
+    }
+
+    println!(
+        "verify-protocol-spec: {listed} spec file(s) vendored from driver {expected}, digests match"
+    );
+    Ok(())
+}
+
+/// Compare a `MANIFEST` against the vendored files, returning how many the
+/// manifest lists and every mismatch found. Pure, so the comparison is
+/// unit-testable without a checkout to mangle.
+fn spec_problems(
+    manifest: &str,
+    vendored: &[(String, Option<Vec<u8>>)],
+) -> Result<(usize, Vec<String>)> {
+    let mut listed: Vec<&str> = Vec::new();
+    let mut problems: Vec<String> = Vec::new();
+    for line in manifest.lines().filter(|line| !line.trim().is_empty()) {
+        let (want, name) = line
+            .split_once("  ")
+            .with_context(|| format!("malformed {SPEC_MANIFEST} line: {line}"))?;
+        listed.push(name);
+        match vendored.iter().find(|(have, _)| have == name) {
+            None => problems.push(format!("{name}: missing")),
+            Some((_, None)) => problems.push(format!("{name}: unreadable")),
+            Some((_, Some(content))) if digest(content) != want => {
+                problems.push(format!("{name}: contents differ from the vendored copy"));
+            }
+            Some(_) => {}
+        }
+    }
+    if listed.is_empty() {
+        bail!("verify-protocol-spec: {SPEC_MANIFEST} lists no files");
+    }
+    for (name, _) in vendored {
+        if !listed.contains(&name.as_str()) {
+            problems.push(format!("{name}: present but not in {SPEC_MANIFEST}"));
+        }
+    }
+    Ok((listed.len(), problems))
+}
+
+/// Fetch every spec file upstream publishes at this driver's tag.
+fn fetch_spec_files(version: &str) -> Result<Vec<(String, Vec<u8>)>> {
+    let listing = format!(
+        "https://api.github.com/repos/microsoft/playwright/contents/packages/protocol/spec?ref=v{version}"
+    );
+    let entries: serde_json::Value =
+        serde_json::from_str(&fetch(&listing)?).context("parse the spec directory listing")?;
+    let entries = entries
+        .as_array()
+        .context("the spec directory listing is not a JSON array")?;
+
+    let mut files = Vec::new();
+    let mut skipped = Vec::new();
+    for entry in entries {
+        let name = entry["name"].as_str().unwrap_or_default().to_string();
+        let kind = entry["type"].as_str().unwrap_or_default();
+        if kind != "file" || !name.ends_with(".yml") {
+            skipped.push(format!("{name} ({kind})"));
+            continue;
+        }
+        let url = entry["download_url"]
+            .as_str()
+            .with_context(|| format!("no download_url for {name}"))?;
+        files.push((name, fetch(url)?.into_bytes()));
+    }
+    if !skipped.is_empty() {
+        // Upstream restructured this directory once already; vendoring part
+        // of it quietly is how a wire contract goes half-reviewed.
+        bail!(
+            "sync-protocol-spec: the spec directory holds entries this command does not \
+             vendor, so the layout changed upstream and this command needs updating:\n  {}",
+            skipped.join("\n  ")
+        );
+    }
+    if files.is_empty() {
+        bail!("sync-protocol-spec: the listing held no .yml files");
+    }
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(files)
+}
+
+/// Hex digest of a vendored file. SHA-1 is enough to catch an edited or
+/// truncated copy, which is all this guards.
+fn digest(content: &[u8]) -> String {
+    use sha1::Digest as _;
+    sha1::Sha1::digest(content)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The vendored `.yml` files, sorted, or an empty vector when none exist.
+fn spec_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("read {}", dir.display()))?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "yml"))
+        .collect();
+    files.sort();
+    Ok(files)
+}
+
+fn fetch(url: &str) -> Result<String> {
+    ureq::get(url)
+        // GitHub rejects requests without one.
+        .header("User-Agent", "playwright-rust-xtask")
+        .call()
+        .with_context(|| format!("GET {url}"))?
+        .body_mut()
+        .read_to_string()
+        .with_context(|| format!("read the body of {url}"))
+}
+
+/// Resolve the workspace root by walking up from the xtask binary's
+/// `CARGO_MANIFEST_DIR` (which Cargo sets at compile time for the
+/// xtask crate to `crates/xtask`).
+/// Every `channel.send*("name", ..)` literal under `crates/playwright/src`
+/// must name a command in `protocol-spec/*.yml`. Events are not checked:
+/// the crate receives those by string match, and an unknown one is simply
+/// never delivered, which the event tests already cover.
+fn verify_protocol_methods() -> Result<()> {
+    let root = workspace_root();
+    let spec_dir = root.join(SPEC_DIR);
+    let mut commands = BTreeSet::new();
+    for path in spec_files(&spec_dir)? {
+        let text =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        commands.extend(spec_commands(&text));
+    }
+    if commands.is_empty() {
+        bail!(
+            "verify-protocol-methods: no commands found under {SPEC_DIR}; run \
+             `cargo xtask sync-protocol-spec`"
+        );
+    }
+
+    let src = root.join("crates/playwright/src");
+    let mut sent = 0usize;
+    let mut unknown: Vec<String> = Vec::new();
+    for path in rust_files(&src)? {
+        let text =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        for (line, method) in sent_methods(&text) {
+            sent += 1;
+            if !commands.contains(method.as_str()) {
+                let rel = path.strip_prefix(&root).unwrap_or(&path).display();
+                unknown.push(format!("{rel}:{line}: `{method}`"));
+            }
+        }
+    }
+
+    if !unknown.is_empty() {
+        bail!(
+            "verify-protocol-methods: {} method name(s) sent by the crate are not commands \
+             in {SPEC_DIR}:\n  {}\n\nThe driver rejects an unknown method and the caller \
+             usually sees a timeout, not an error. Check the `commands:` block of the \
+             object's yml for the name upstream uses.",
+            unknown.len(),
+            unknown.join("\n  ")
+        );
+    }
+    println!(
+        "verify-protocol-methods: {sent} send site(s) checked against {} spec command(s)",
+        commands.len()
+    );
+    Ok(())
+}
+
+/// The command names of one protocol yml: every four-space-indented key
+/// under a two-space `commands:` key, for every object in the file.
+fn spec_commands(yml: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut in_commands = false;
+    for line in yml.lines() {
+        if line.starts_with("  ") && !line.starts_with("   ") {
+            in_commands = line.trim_end() == "  commands:";
+        } else if !line.starts_with(' ') && !line.trim().is_empty() {
+            in_commands = false;
+        } else if in_commands
+            && line.starts_with("    ")
+            && !line.starts_with("     ")
+            && let Some(name) = line.trim().strip_suffix(':')
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            out.insert(name.to_string());
+        }
+    }
+    out
+}
+
+/// The channel calls that take a protocol method name as their first
+/// argument. Keep in step with `server::channel::Channel`.
+const SEND_CALLS: [&str; 4] = [".send_no_result", ".send_no_params", ".notify", ".send"];
+
+/// `(line, method)` for every channel call whose first argument is a
+/// string literal, including calls that rustfmt split across lines.
+/// Non-literal method arguments are not this gate's business.
+fn sent_methods(source: &str) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let bytes = source.as_bytes();
+    let mut search = 0;
+    while let Some((at, call)) = SEND_CALLS
+        .iter()
+        .filter_map(|call| source[search..].find(call).map(|i| (search + i, *call)))
+        .min_by_key(|(i, call)| (*i, std::cmp::Reverse(call.len())))
+    {
+        let rest = &source[at + call.len()..];
+        // optional turbofish, then the opening paren
+        let rest = if let Some(after) = rest.strip_prefix("::<") {
+            match after.find('>') {
+                Some(end) => &after[end + 1..],
+                None => {
+                    search = at + 1;
+                    continue;
+                }
+            }
+        } else {
+            rest
+        };
+        if let Some(args) = rest.strip_prefix('(') {
+            let args = args.trim_start();
+            if let Some(lit) = args.strip_prefix('"')
+                && let Some(end) = lit.find('"')
+            {
+                let method = &lit[..end];
+                if !method.is_empty()
+                    && method
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    let line = bytes[..at].iter().filter(|&&b| b == b'\n').count() + 1;
+                    out.push((line, method.to_string()));
+                }
+            }
+        }
+        search = at + 1;
+    }
+    out
+}
+
+fn rust_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
+        let path = entry?.path();
+        if path.is_dir() {
+            out.extend(rust_files(&path)?);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("xtask manifest dir has two parents")
+        .to_path_buf()
+}
+
+#[cfg(test)]
+mod spec_manifest_tests {
+    use super::*;
+
+    fn vendored(files: &[(&str, &str)]) -> Vec<(String, Option<Vec<u8>>)> {
+        files
+            .iter()
+            .map(|(name, body)| (name.to_string(), Some(body.as_bytes().to_vec())))
+            .collect()
+    }
+
+    fn manifest_for(files: &[(&str, &str)]) -> String {
+        files
+            .iter()
+            .map(|(name, body)| format!("{}  {name}\n", digest(body.as_bytes())))
+            .collect()
+    }
+
+    #[test]
+    fn a_matching_tree_has_no_problems() {
+        let files = [
+            ("page.yml", "commands:\n"),
+            ("frame.yml", "commands:\n  goto:\n"),
+        ];
+        let (listed, problems) = spec_problems(&manifest_for(&files), &vendored(&files)).unwrap();
+
+        assert_eq!(listed, 2);
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    #[test]
+    fn an_edited_file_is_reported() {
+        let files = [("page.yml", "commands:\n")];
+        let manifest = manifest_for(&files);
+        // What a CRLF checkout does to a byte-exact tree.
+        let (_, problems) =
+            spec_problems(&manifest, &vendored(&[("page.yml", "commands:\r\n")])).unwrap();
+
+        assert_eq!(
+            problems,
+            ["page.yml: contents differ from the vendored copy"]
+        );
+    }
+
+    #[test]
+    fn a_missing_file_is_reported() {
+        let manifest = manifest_for(&[("page.yml", "a"), ("frame.yml", "b")]);
+        let (listed, problems) = spec_problems(&manifest, &vendored(&[("page.yml", "a")])).unwrap();
+
+        assert_eq!(listed, 2);
+        assert_eq!(problems, ["frame.yml: missing"]);
+    }
+
+    #[test]
+    fn a_file_the_manifest_does_not_list_is_reported() {
+        let manifest = manifest_for(&[("page.yml", "a")]);
+        let (_, problems) = spec_problems(
+            &manifest,
+            &vendored(&[("page.yml", "a"), ("rogue.yml", "x")]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            problems,
+            ["rogue.yml: present but not in protocol-spec/MANIFEST"]
+        );
+    }
+
+    #[test]
+    fn an_empty_manifest_is_an_error() {
+        assert!(spec_problems("\n", &vendored(&[("page.yml", "a")])).is_err());
+    }
+
+    #[test]
+    fn a_malformed_manifest_line_is_an_error() {
+        assert!(spec_problems("no-two-space-separator\n", &[]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod driver_version_tests {
+    use super::*;
+
+    #[test]
+    fn versions_after_extracts_each_occurrence() {
+        let text = "npx playwright@1.61.0 install\nkey: os-pw-driver-1.61.0\n\
+                    os-playwright-browsers-1.61.0-v2";
+        assert_eq!(versions_after(text, "playwright@"), vec!["1.61.0"]);
+        assert_eq!(
+            versions_after("confirmed against playwright@1.61.0.", "playwright@"),
+            vec!["1.61.0"],
+            "sentence-final punctuation is not part of the version"
+        );
+        assert_eq!(versions_after(text, "pw-driver-"), vec!["1.61.0"]);
+        assert_eq!(versions_after(text, "playwright-browsers-"), vec!["1.61.0"]);
+    }
+
+    #[test]
+    fn versions_after_flags_a_stale_token() {
+        let text = "playwright@1.60.0 and playwright@1.61.0";
+        assert_eq!(
+            versions_after(text, "playwright@"),
+            vec!["1.60.0", "1.61.0"]
+        );
+    }
+
+    #[test]
+    fn versions_after_ignores_prefix_without_version() {
+        assert!(versions_after("playwright@latest", "playwright@").is_empty());
+    }
+
+    #[test]
+    fn build_rs_version_is_three_part_semver() {
+        let v = read_driver_version(&workspace_root()).unwrap();
+        assert_eq!(
+            v.split('.').count(),
+            3,
+            "expected MAJOR.MINOR.PATCH, got {v}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod changelog_link_tests {
+    use super::*;
+
+    const GOOD: &str = "\
+# Changelog
+
+## [Unreleased]
+
+## [0.2.0] - 2026-08-02
+
+## [0.1.1] - 2026-07-01
+
+## [0.1.0] - 2026-05-23
+
+[Unreleased]: https://github.com/padamson/playwright-rust/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/padamson/playwright-rust/compare/v0.1.1...v0.2.0
+[0.1.1]: https://github.com/padamson/playwright-rust/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/padamson/playwright-rust/releases/tag/v0.1.0
+";
+
+    #[test]
+    fn a_correct_footer_reports_nothing() {
+        assert!(changelog_link_problems(GOOD, "v").is_empty());
+    }
+
+    #[test]
+    fn headings_and_defs_are_parsed_separately() {
+        assert_eq!(
+            changelog_headings(GOOD),
+            ["Unreleased", "0.2.0", "0.1.1", "0.1.0"]
+        );
+        let labels: Vec<String> = changelog_link_defs(GOOD)
+            .into_iter()
+            .map(|(l, _)| l)
+            .collect();
+        assert_eq!(labels, ["Unreleased", "0.2.0", "0.1.1", "0.1.0"]);
+    }
+
+    #[test]
+    fn a_heading_with_no_link_definition_is_caught() {
+        // The actual rot: three releases landed headings without ever
+        // adding the matching definition.
+        let broken = GOOD.replace(
+            "[0.2.0]: https://github.com/padamson/playwright-rust/compare/v0.1.1...v0.2.0\n",
+            "",
+        );
+        let problems = changelog_link_problems(&broken, "v");
+        assert!(
+            problems.iter().any(|p| p.contains("`## [0.2.0]` has no")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_stale_unreleased_base_is_caught() {
+        // What the main CHANGELOG looked like: still comparing from a
+        // release three versions behind.
+        let broken = GOOD.replace("compare/v0.2.0...HEAD", "compare/v0.1.0...HEAD");
+        let problems = changelog_link_problems(&broken, "v");
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("`[Unreleased]:`") && p.contains("latest release")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_compare_link_that_skips_a_version_is_caught() {
+        let broken = GOOD.replace("compare/v0.1.1...v0.2.0", "compare/v0.1.0...v0.2.0");
+        let problems = changelog_link_problems(&broken, "v");
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("should compare against 0.1.1")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn an_orphan_definition_is_caught() {
+        let broken = format!("{GOOD}[9.9.9]: https://example.com/nope\n");
+        let problems = changelog_link_problems(&broken, "v");
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("no `## [9.9.9]` heading")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn the_tag_prefix_is_honored_per_crate() {
+        // A macros/trace footer using the bare `v` prefix must fail.
+        let problems = changelog_link_problems(GOOD, "trace-v");
+        assert!(!problems.is_empty());
+        assert!(
+            problems.iter().any(|p| p.contains("trace-v0.2.0")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn the_real_changelogs_are_consistent() {
+        let root = workspace_root();
+        for (rel, prefix) in CHANGELOGS {
+            let content = std::fs::read_to_string(root.join(rel)).unwrap();
+            let problems = changelog_link_problems(&content, prefix);
+            assert!(problems.is_empty(), "{rel}:\n{}", problems.join("\n"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod skill_coverage_tests {
+    use super::*;
+
+    const MANIFEST: &str = "\
+[package]
+name = \"playwright-rs\"
+
+[features]
+default = [\"native-tls\", \"macros\", \"ring\"]
+native-tls = [\"tokio-tungstenite/native-tls\"]
+# retired-feature = [\"dep:gone\"]
+ = \"malformed\"
+screenshot-diff = [\"dep:image\"]
+cli = [
+    \"dep:clap\",
+    \"dep:ureq\",
+]
+
+[dependencies]
+anyhow = \"1\"
+";
+
+    #[test]
+    fn feature_names_reads_the_table_and_stops_at_the_next_section() {
+        assert_eq!(
+            feature_names(MANIFEST),
+            vec!["default", "native-tls", "screenshot-diff", "cli"],
+            "multi-line feature arrays must not leak their entries, \
+             [dependencies] must not be read as features, and a commented-out \
+             or nameless line must not become a feature the skill has to document"
+        );
+    }
+
+    #[test]
+    fn feature_names_is_empty_without_a_features_table() {
+        assert!(feature_names("[package]\nname = \"x\"\n").is_empty());
+    }
+
+    #[test]
+    fn browser_engines_finds_accessors_by_return_type() {
+        let src = "\
+    pub fn chromium(&self) -> &BrowserType {
+    pub fn firefox(&self) -> &BrowserType {
+    pub fn chromium_sandbox(mut self, enabled: bool) -> Self {
+    fn private_engine(&self) -> &BrowserType {
+";
+        assert_eq!(
+            browser_engines(src),
+            vec!["chromium", "firefox"],
+            "only public accessors returning &BrowserType count"
+        );
+    }
+
+    #[test]
+    fn mentions_requires_a_whole_token() {
+        // The bug this guards: `contains` let the `cli` feature match
+        // "click"/"client" in the prose, so it passed while undocumented.
+        assert!(!mentions("use page.click() on the client", "cli"));
+        assert!(mentions("the `cli` feature builds an installer", "cli"));
+        assert!(mentions("cli", "cli"));
+    }
+
+    #[test]
+    fn mentions_does_not_treat_a_hyphen_as_a_boundary() {
+        // `screenshot-diff` must not be satisfied by a bare "screenshot",
+        // nor "ring" by "rustls-tls-native-roots".
+        assert!(!mentions(
+            "take a screenshot of the page",
+            "screenshot-diff"
+        ));
+        assert!(mentions(
+            "enable `screenshot-diff` for baselines",
+            "screenshot-diff"
+        ));
+        assert!(!mentions("aws-lc-rs is the backend", "aws-lc"));
+    }
+}
+
+#[cfg(test)]
+mod protocol_method_tests {
+    use super::*;
+
+    #[test]
+    fn commands_are_collected_per_object_and_events_are_not() {
+        let yml = "Page:\n  type: interface\n  commands:\n\n    goto:\n      parameters:\n        url: string\n\n    reload:\n\n  events:\n\n    load:\n\nFrame:\n  commands:\n    evaluateExpression:\n";
+        let got = spec_commands(yml);
+        assert_eq!(
+            got.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["evaluateExpression", "goto", "reload"]
+        );
+    }
+
+    #[test]
+    fn literals_are_found_on_one_line_split_lines_and_with_turbofish() {
+        let src = r#"
+            self.channel().send("goto", json!({})).await?;
+            self.channel()
+                .send_no_result(
+                    "setTestIdAttributeName",
+                    json!({}),
+                )
+                .await?;
+            let v: Value = self.channel().send_no_params("pathAfterFinished").await?;
+            let r: Resp = self.channel().send::<_, Resp>("evaluate", p).await?;
+            self.channel().send(method, p).await?;
+            self.sender.send(msg).await?;
+            self.channel().notify("screencastFrameAck", p).await;
+        "#;
+        let found = sent_methods(src);
+        let got: Vec<(usize, &str)> = found.iter().map(|(l, m)| (*l, m.as_str())).collect();
+        assert_eq!(
+            got,
+            [
+                (2, "goto"),
+                (4, "setTestIdAttributeName"),
+                (9, "pathAfterFinished"),
+                (10, "evaluate"),
+                (13, "screencastFrameAck")
+            ]
+        );
+    }
+}

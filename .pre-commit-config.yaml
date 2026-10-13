@@ -1,0 +1,205 @@
+# Pre-commit hooks for playwright-rust, run by prek
+# Install: cargo install prek && prek install --overwrite
+# Run manually: prek run --all-files
+
+# Stop at first failure to save time (e.g., don't run tests if fmt fails)
+fail_fast: true
+
+repos:
+  # Standard pre-commit hooks for common issues
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: check-yaml
+        name: Check YAML syntax
+      - id: check-toml
+        name: Check TOML syntax
+      - id: check-merge-conflict
+        name: Check for merge conflicts
+      - id: check-case-conflict
+        name: Check for case conflicts
+      - id: detect-private-key
+        name: Detect private keys
+      # Two byte-exact trees. Fuzz seeds are byte sequences fed to a parser,
+      # not source text: appending a newline or trimming whitespace edits the
+      # input under test. `protocol-spec/` is vendored verbatim from upstream,
+      # so any local edit would resurface as a false delta on the next sync.
+      - id: trailing-whitespace
+        name: Trim trailing whitespace
+        exclude: ^(crates/playwright/fuzz/seeds/|protocol-spec/)
+      - id: end-of-file-fixer
+        name: Fix end of files
+        exclude: ^(crates/playwright/fuzz/seeds/|protocol-spec/)
+      - id: mixed-line-ending
+        name: Fix mixed line endings
+        exclude: ^(crates/playwright/fuzz/seeds/|protocol-spec/)
+
+  # Rust-specific checks (matches CI exactly)
+  - repo: local
+    hooks:
+      # 1. Format code (auto-fix)
+      # Note: CI uses cargo fmt -- --check for enforcement
+      - id: cargo-fmt
+        name: cargo fmt
+        description: Auto-format Rust code
+        entry: cargo fmt --all
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      # 2. Clippy (same as CI: cargo clippy -- -D warnings)
+      - id: cargo-clippy
+        name: cargo clippy
+        description: Run clippy linter
+        entry: cargo clippy --all-targets --all-features -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      # 3. Cargo check (fast compilation check)
+      - id: cargo-check
+        name: cargo check
+        description: Check Rust code compiles
+        entry: cargo check --workspace
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      # 4. Run tests (same as CI: cargo nextest run)
+      - id: cargo-nextest
+        name: cargo nextest run
+        description: Run unit and integration tests with nextest
+        entry: cargo nextest run --workspace
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      # 5. Run doc-tests (same as CI: cargo test --doc)
+      - id: cargo-doctest
+        name: cargo test --doc
+        description: Run documentation tests
+        entry: cargo test --doc --workspace
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      # 5a. Verify agent-integration snippets compile against the
+      # current playwright-rs API. Catches drift between
+      # docs/agent/CLAUDE_SNIPPET.md / SKILL.md and the crate.
+      - id: verify-agent-docs
+        name: cargo xtask verify-agent-docs
+        description: Compile-check the rust,no_run snippets in the agent-integration docs
+        entry: cargo xtask verify-agent-docs
+        language: system
+        pass_filenames: false
+        # Run when the snippet sources change OR when the crate API
+        # surface changes.
+        files: (docs/agent/|skills/playwright-rs-usage/|crates/playwright/src/|crates/playwright/Cargo\.toml|crates/playwright-rs-macros/src/|crates/xtask/src/)
+
+      # 5b. Verify every source/CI reference to the bundled Playwright
+      # version matches build.rs PLAYWRIGHT_VERSION (README excluded —
+      # it tracks the published crates.io release).
+      - id: verify-driver-version
+        name: cargo xtask verify-driver-version
+        description: Check install hints and CI cache keys against build.rs PLAYWRIGHT_VERSION
+        entry: cargo xtask verify-driver-version
+        language: system
+        pass_filenames: false
+        files: (crates/playwright/build\.rs|crates/playwright/src/lib\.rs|crates/playwright/examples/connect_over_cdp\.rs|\.github/workflows/(test|release|pages)\.yml|crates/xtask/src/)
+
+      # 5b-bis. The vendored protocol spec must be the pinned driver's, so a
+      # bump cannot land without the wire-contract diff being seen. Offline:
+      # the fetch is `cargo xtask sync-protocol-spec`, run at bump time.
+      - id: verify-protocol-spec
+        name: cargo xtask sync-protocol-spec --check
+        description: Check the vendored protocol spec against build.rs PLAYWRIGHT_VERSION
+        entry: cargo xtask sync-protocol-spec --check
+        language: system
+        pass_filenames: false
+        files: (crates/playwright/build\.rs|protocol-spec/|crates/xtask/src/)
+
+      # 5b-ter. Every method name the crate sends must be a command in that
+      # spec. The driver rejects an unknown method and the crate mostly
+      # discards the rejection, so the caller sees a timeout, not an error:
+      # three such names shipped for several releases each.
+      - id: verify-protocol-methods
+        name: cargo xtask verify-protocol-methods
+        description: Check every channel send("...") literal against the vendored spec's commands
+        entry: cargo xtask verify-protocol-methods
+        language: system
+        pass_filenames: false
+        files: (crates/playwright/src/|protocol-spec/|crates/xtask/src/)
+
+      # 5c. Verify each per-crate CHANGELOG's reference-link footer still
+      # agrees with its version headings. Hand-maintained at release time,
+      # and it had silently drifted across three releases before this.
+      - id: verify-changelog-links
+        name: cargo xtask verify-changelog-links
+        description: Check CHANGELOG compare-link footers against their version headings
+        entry: cargo xtask verify-changelog-links
+        language: system
+        pass_filenames: false
+        files: (crates/(playwright|playwright-rs-macros|playwright-rs-trace)/CHANGELOG\.md|crates/xtask/src/)
+
+      # The skill's metadata.version is the only version an installed copy
+      # carries: `npx skills add` copies the skill and has no version of its
+      # own, so a content change without a bump is invisible to every
+      # consumer. Pure bookkeeping, so easy to forget; the hook makes it
+      # impossible.
+      - id: skill-version-bumped
+        name: skill version bumped
+        description: Skill edits must bump metadata.version (the consumer update gate)
+        entry: ./scripts/check-skill-version-bumped.sh
+        language: system
+        pass_filenames: false
+        files: ^skills/
+
+      # 6. Security audit (same as CI: cargo audit)
+      - id: cargo-audit
+        name: cargo audit
+        description: Check dependencies for known vulnerabilities
+        entry: scripts/audit-lockfiles.sh
+        language: system
+        pass_filenames: false
+        # Only run when dependency files change (not on every Rust file edit)
+        files: (Cargo\.toml|Cargo\.lock)$
+
+      # 7. License & dependency check (same as CI: cargo deny check)
+      - id: cargo-deny
+        name: cargo deny
+        description: Check licenses, bans, and source restrictions
+        entry: cargo deny check
+        language: system
+        pass_filenames: false
+        # Only run when dependency or deny config files change
+        files: (Cargo\.toml|Cargo\.lock|deny\.toml)$
+
+      # 8. Supply chain review (same as CI: cargo vet)
+      - id: cargo-vet
+        name: cargo vet
+        description: Verify dependency supply chain audits
+        entry: cargo vet
+        language: system
+        pass_filenames: false
+        # Only run when dependency or supply-chain config files change
+        files: (Cargo\.toml|Cargo\.lock|^supply-chain/)
+
+      - id: mutants-test-targets
+        name: mutation kill set names every test binary
+        description: a browser-free test binary missing from .cargo/mutants.toml kills nothing
+        entry: scripts/check-mutants-test-targets.sh
+        language: system
+        pass_filenames: false
+        files: ^(crates/playwright/tests/[^/]+\.rs|\.cargo/mutants\.toml|scripts/check-mutants-test-targets\.sh)$
+
+      - id: external-lockfiles-current
+        name: out-of-workspace lockfiles current
+        description: site, site-e2e and fuzz sit outside the workspace, so their lockfiles go stale when workspace deps move
+        entry: scripts/check-external-lockfiles.sh
+        language: system
+        pass_filenames: false
+        # Fires on the commits that CAUSE the drift — workspace manifest/lock
+        # changes. No workflow catches this: Pages only triggers on
+        # crates/site**, and the fuzz job is weekly and does not use --locked;
+        # such a commit touches neither path.
+        files: ^(Cargo\.toml|Cargo\.lock|crates/playwright/Cargo\.toml)$
