@@ -64,7 +64,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cd playwright-rust
-          rm -rf .git
+          # GITHUB_TOKEN cannot push workflow files, and upstream's CI is not part of the crate
+          rm -rf .git .github
           git init -q
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
