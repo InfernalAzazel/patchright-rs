@@ -1,0 +1,9 @@
+[package]
+name = "patchright-rs-patcher"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "patch_rust_package"
+path = "src/patch_rust_package.rs"

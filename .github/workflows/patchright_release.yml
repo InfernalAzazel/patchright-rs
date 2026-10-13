@@ -1,0 +1,74 @@
+name: Patchright Release Workflow
+
+on:
+  # enabling manual trigger
+  workflow_dispatch:
+  # running every hour
+  schedule:
+    - cron: '0 * * * *'
+
+concurrency:
+  group: patchright-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  check-release-version:
+    name: Check Release Version
+    runs-on: ubuntu-latest
+    outputs:
+      proceed: ${{ steps.version_check.outputs.proceed }}
+      playwright_rs_version: ${{ steps.version_check.outputs.playwright_rs_version }}
+      patchright_core_version: ${{ steps.version_check.outputs.patchright_core_version }}
+      patchright_version: ${{ steps.version_check.outputs.patchright_version }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+
+      - name: Check Release Version
+        id: version_check
+        run: src/utils/release_version_check.sh
+
+  patchright-release-workflow:
+    name: "Patchright-Rust Workflow: Clone, Patch, Test and Release patchright-rs"
+    needs: check-release-version
+    if: needs.check-release-version.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    env:
+      playwright_rs_version: ${{ needs.check-release-version.outputs.playwright_rs_version }}
+      patchright_core_version: ${{ needs.check-release-version.outputs.patchright_core_version }}
+      patchright_version: ${{ needs.check-release-version.outputs.patchright_version }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Clone playwright-rs
+        run: git clone --depth 1 --branch "$playwright_rs_version" https://github.com/padamson/playwright-rust
+
+      - name: Patch playwright-rs
+        run: cargo run --release
+
+      - name: Test patchright-rs
+        run: |
+          cd playwright-rust
+          cargo build -p patchright-rs --all-features
+          cargo test -p patchright-rs --lib
+
+      - name: Release patchright-rs as a tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd playwright-rust
+          rm -rf .git
+          git init -q
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "patchright-rs v$patchright_version (playwright-rs $playwright_rs_version, patchright-core $patchright_core_version)"
+          git tag "v$patchright_version"
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/v$patchright_version"
