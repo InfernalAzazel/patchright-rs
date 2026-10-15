@@ -41,13 +41,13 @@ Patchright-Rust is not on crates.io. Every release is a `v<version>` [tag](https
 ```toml
 # Cargo.toml
 [dependencies]
-patchright-rs = { git = "https://github.com/InfernalAzazel/patchright-rs", tag = "v0.19.0" }
+patchright-rs = { git = "https://github.com/InfernalAzazel/patchright-rs", tag = "v0.20.0" }
 tokio = { version = "1", features = ["full"] }
 ```
 
 ```bash
 # Install Chromium-Driver for Patchright
-cargo install --git https://github.com/InfernalAzazel/patchright-rs --tag v0.19.0 patchright-rs --features cli
+cargo install --git https://github.com/InfernalAzazel/patchright-rs --tag v0.20.0 patchright-rs --features cli
 patchright-rs install chromium
 ```
 
@@ -209,8 +209,8 @@ The [release workflow](.github/workflows/patchright_release.yml) runs hourly: [`
 
 To build locally:
 ```bash
-git clone --depth 1 --branch v0.19.0 https://github.com/padamson/playwright-rust
-patchright_core_version=1.63.0 patchright_version=0.19.0 cargo run
+git clone --depth 1 --branch v0.20.0 https://github.com/padamson/playwright-rust
+patchright_core_version=1.64.1 patchright_version=0.20.0 cargo run
 cd playwright-rust && cargo build -p patchright-rs
 ```
 

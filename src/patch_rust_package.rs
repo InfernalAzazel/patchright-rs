@@ -4,8 +4,8 @@
 //! its `playwright-rs` crate into `patchright-rs`, driven by `patchright-core`.
 //!
 //! ```sh
-//! git clone --depth 1 --branch v0.19.0 https://github.com/padamson/playwright-rust
-//! patchright_core_version=1.63.0 patchright_version=0.19.0 cargo run
+//! git clone --depth 1 --branch v0.20.0 https://github.com/padamson/playwright-rust
+//! patchright_core_version=1.64.1 patchright_version=0.20.0 cargo run
 //! ```
 
 mod utils;
@@ -70,10 +70,10 @@ fn main() {
     for file in [build_rs, driver_urls, driver] {
         patch_all(file, "playwright-rust", "patchright-rust");
     }
-    patch_all(build_rs, "playwright-{", "patchright-{");
+    // v0.20.0 moved the driver directory name and the npm package name into
+    // `driver_urls`; `build.rs` and `driver.rs` no longer spell them out.
     patch_all(driver_urls, "playwright-{", "patchright-{");
     patch_all(driver_urls, "playwright-1.", "patchright-1.");
-    patch_all(driver, "playwright-1.", "patchright-1.");
     patch(
         driver,
         "        node_modules.join(\"playwright\"),\n        node_modules.join(\"@playwright\").join(\"test\"),",
@@ -182,7 +182,7 @@ pub(crate) async fn inject_route_handler(route: crate::protocol::Route) -> crate
 /// `focusControl` option for `new_context`, `new_page` and
 /// `launch_persistent_context`, which all take `BrowserContextOptions`.
 fn patch_focus_control() {
-    let file = &format!("{CRATE}/src/protocol/browser_context.rs");
+    let file = &format!("{CRATE}/src/protocol/browser_context/options.rs");
     insert_after(
         file,
         "    #[serde(skip_serializing_if = \"Option::is_none\")]\n    pub service_workers: Option<String>,\n",
@@ -202,6 +202,20 @@ fn patch_focus_control() {
         file,
         "            service_workers: self.service_workers,\n",
         "            focus_control: self.focus_control,\n",
+    );
+    // `every_key_sent_is_a_parameter_the_driver_declares` builds the options
+    // struct as a literal with no `..Default::default()`, so the new field
+    // breaks it until it is listed, and `focusControl` is a patchright-core
+    // extension the vanilla protocol spec cannot declare.
+    insert_after(
+        file,
+        "            service_workers: Some(String::new()),\n",
+        "            focus_control: Some(false),\n",
+    );
+    patch(
+        file,
+        "        assert_eq!(undeclared, [\"storageStatePath\", \"timeout\"]);\n",
+        "        assert_eq!(undeclared, [\"focusControl\", \"storageStatePath\", \"timeout\"]);\n",
     );
 }
 
@@ -285,7 +299,7 @@ fn patch_route() {
     let dispatch_tail = "                if !route.was_handled() {\n                    continue;\n                }\n                break;\n            }\n        }\n";
     let finish = "\n        if !route.was_handled()\n            && let Err(e) = route.finish_fallback().await\n        {\n            tracing::warn!(\"Route fallback failed: {}\", e);\n        }\n";
     insert_after(&format!("{CRATE}/src/protocol/page/network.rs"), dispatch_tail, finish);
-    insert_after(&format!("{CRATE}/src/protocol/browser_context.rs"), dispatch_tail, finish);
+    insert_after(&format!("{CRATE}/src/protocol/browser_context/network.rs"), dispatch_tail, finish);
 }
 
 /// `install_inject_route`: before init scripts, bindings, clock or tracing
@@ -297,7 +311,10 @@ fn patch_inject_route() {
     let page_lifecycle = &format!("{CRATE}/src/protocol/page/lifecycle.rs");
     let page_network = &format!("{CRATE}/src/protocol/page/network.rs");
     let page_bindings = &format!("{CRATE}/src/protocol/page/bindings.rs");
-    let context = &format!("{CRATE}/src/protocol/browser_context.rs");
+    let ctx_mod = &format!("{CRATE}/src/protocol/browser_context/mod.rs");
+    let ctx_lifecycle = &format!("{CRATE}/src/protocol/browser_context/lifecycle.rs");
+    let ctx_network = &format!("{CRATE}/src/protocol/browser_context/network.rs");
+    let ctx_bindings = &format!("{CRATE}/src/protocol/browser_context/bindings.rs");
     let clock = &format!("{CRATE}/src/protocol/clock.rs");
     let tracing = &format!("{CRATE}/src/protocol/tracing.rs");
     let install = "        self.install_inject_route().await?;\n";
@@ -324,7 +341,7 @@ fn patch_inject_route() {
         let handler = Arc::new(|route: Route| -> RouteHandlerFuture {
             Box::pin(crate::patchright::inject_route_handler(route))
         });
-        let entry = RouteHandlerEntry { pattern: "**/*".to_string(), handler };
+        let entry = RouteHandlerEntry { pattern: "**/*".to_string(), handler, in_flight: Arc::default() };
         self.route_handlers.lock().unwrap().insert(0, entry);
         self.enable_network_interception().await
     }
@@ -335,38 +352,38 @@ fn patch_inject_route() {
     insert_before(page_bindings, "        let callback: PageBindingCallback = Arc::new(", install);
 
     patch(
-        context,
+        ctx_mod,
         "    route_handlers: Arc<Mutex<Vec<RouteHandlerEntry>>>,\n    /// APIRequestContext",
         "    route_handlers: Arc<Mutex<Vec<RouteHandlerEntry>>>,\n    route_injecting: Arc<AtomicBool>,\n    /// APIRequestContext",
     );
     insert_after(
-        context,
+        ctx_lifecycle,
         "            route_handlers: Arc::new(Mutex::new(Vec::new())),\n            request_context_guid,\n",
         "            route_injecting: Arc::new(AtomicBool::new(false)),\n",
     );
     insert_before(
-        context,
-        "    /// Handles a route event from the protocol\n    async fn on_route_event(",
+        ctx_network,
+        "    /// Handles a route event from the protocol\n    pub(super) async fn on_route_event(",
         r#"    pub(crate) fn route_injecting(&self) -> bool {
-        self.route_injecting.load(Ordering::SeqCst)
+        self.route_injecting.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub(crate) async fn install_inject_route(&self) -> Result<()> {
-        if self.route_injecting.swap(true, Ordering::SeqCst) {
+        if self.route_injecting.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return Ok(());
         }
         let handler = Arc::new(|route: Route| -> RouteHandlerFuture {
             Box::pin(crate::patchright::inject_route_handler(route))
         });
-        let entry = RouteHandlerEntry { pattern: "**/*".to_string(), handler };
+        let entry = RouteHandlerEntry { pattern: "**/*".to_string(), handler, in_flight: Arc::default() };
         self.route_handlers.lock().unwrap().insert(0, entry);
         self.enable_network_interception().await
     }
 
 "#,
     );
-    insert_after(context, "    pub async fn add_init_script(&self, script: &str) -> Result<()> {\n", install);
-    insert_before(context, "        let callback: BindingCallback = Arc::new(", install);
+    insert_after(ctx_bindings, "    pub async fn add_init_script(&self, script: &str) -> Result<()> {\n", install);
+    insert_before(ctx_bindings, "        let callback: BindingCallback = Arc::new(", install);
 
     patch(
         clock,
@@ -384,7 +401,7 @@ fn patch_inject_route() {
         "        if let Some(context) = &self.context {\n            context.install_inject_route().await?;\n        }\n",
     );
     patch(
-        context,
+        ctx_lifecycle,
         "        crate::protocol::clock::Clock::new(self.channel().clone())\n",
         "        crate::protocol::clock::Clock::new(self.channel().clone()).with_context(self.clone())\n",
     );
@@ -405,7 +422,7 @@ fn patch_dialog() {
         "    pub(crate) fn has_dialog_listeners(&self) -> bool {\n        !self.dialog.is_idle()\n    }\n\n",
     );
     patch(
-        &format!("{CRATE}/src/protocol/browser_context.rs"),
+        &format!("{CRATE}/src/protocol/browser_context/dispatch.rs"),
         r#"                        // Dispatch to context-level dialog handlers first
                         ctx_dialog.dispatch(dialog.clone()).await;
 
