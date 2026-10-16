@@ -694,9 +694,13 @@ pub(crate) fn download_failed_message(reason: &str) -> String {
 
     // The three-way decision is a pure function, so it gets a pure test; the
     // async wrapper around it is straight-line code over tested parts.
+    //
+    // The anchor includes the neighbour's `#[test]` line: anchoring on the `fn`
+    // alone would leave that attribute attached to the first test inserted
+    // here, silently disabling the test it belonged to.
     insert_before(
         driver,
-        "    fn install_args_request_system_deps_only_when_asked() {",
+        "    #[test]\n    fn install_args_request_system_deps_only_when_asked() {",
         r#"    #[test]
     fn only_a_missing_driver_triggers_the_runtime_download() {
         assert!(should_download(&Error::ServerNotFound));
