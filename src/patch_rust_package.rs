@@ -112,6 +112,10 @@ fn main() {
 
     // Write the project's README to the README used in the release
     write("README.md", &fs::read_to_string("README.md").unwrap());
+
+    // The runtime driver download. Last, so every anchor below sees the tree
+    // the earlier patches have already settled.
+    patch_driver_download();
 }
 
 /// `evaluate` / `evaluate_handle` / `evaluate_all` run in an isolated world
@@ -479,5 +483,32 @@ fn patch_no_console_window() {
         // host has none (GUI-subsystem apps like Tauri); suppress it.
         #[cfg(windows)]
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW"#,
+    );
+}
+
+/// The `driver-download` feature: assemble the driver at *runtime*, for a
+/// machine that only ever received the built binary.
+///
+/// `build.rs` assembles the driver on the build machine and records that
+/// machine's cache path, so a distributed binary finds nothing: the recorded
+/// path names the builder, and the user cache is empty on the machine that
+/// runs the binary. This feature is what puts a driver on *that* machine.
+///
+/// On by default. A consumer that brackets the crate (`ghost-job` does) takes
+/// default features, and an opt-in knob would push the work back onto every
+/// downstream binary that needs it — which is the arrangement this exists to
+/// remove.
+fn patch_driver_download() {
+    let manifest = &format!("{CRATE}/Cargo.toml");
+    // The same dependency set `cli` already declares: one downloader.
+    insert_before(
+        manifest,
+        "cli = [\n",
+        "driver-download = [\n    \"dep:ureq\",\n    \"dep:rustls\",\n    \"dep:zip\",\n    \"dep:flate2\",\n    \"dep:tar\",\n]\n",
+    );
+    patch(
+        manifest,
+        "default = [\"native-tls\", \"macros\", \"ring\", \"route-service\"]\n",
+        "default = [\"native-tls\", \"macros\", \"ring\", \"route-service\", \"driver-download\"]\n",
     );
 }
