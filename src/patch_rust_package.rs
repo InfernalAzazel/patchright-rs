@@ -605,7 +605,7 @@ fn patch_runtime_download() {
         "pub fn get_driver_executable() -> Result<(PathBuf, PathBuf)> {\n    resolve_driver(|name| std::env::var(name).ok())\n}\n",
         r#"
 /// Locate the driver, assembling one into this machine's user cache first if
-/// there is none.
+/// there is none, reporting each step to `report`.
 ///
 /// [`get_driver_executable`] covers a machine that built the crate: the build
 /// script assembled a driver there and the user cache is populated. A machine
@@ -617,13 +617,18 @@ fn patch_runtime_download() {
 /// is set but wrong stays an error: it is a misconfiguration, and fetching a
 /// driver would hide it.
 ///
+/// `report` is called on a blocking thread, so it must be `Send + Sync`, and a
+/// panic in it is swallowed rather than failing the assembly.
+///
 /// # Errors
 ///
 /// Whatever [`get_driver_executable`] returns, when it resolves or when the
 /// download is not attempted; [`Error::DriverDownloadFailed`] when the
 /// assembly was tried and failed, naming the failure and repeating the ways to
 /// provide a driver.
-pub async fn ensure_driver() -> Result<(PathBuf, PathBuf)> {
+pub async fn ensure_driver_with(
+    report: impl Fn(DriverProgress) + Send + Sync + 'static,
+) -> Result<(PathBuf, PathBuf)> {
     match get_driver_executable() {
         Ok(found) => return Ok(found),
         Err(e) if !should_download(&e) => return Err(e),
@@ -631,8 +636,11 @@ pub async fn ensure_driver() -> Result<(PathBuf, PathBuf)> {
     }
 
     #[cfg(feature = "driver-download")]
-    match tokio::task::spawn_blocking(|| {
-        crate::server::driver_download::assemble_into_user_cache(|name| std::env::var(name).ok(), &|_| {})
+    match tokio::task::spawn_blocking(move || {
+        crate::server::driver_download::assemble_into_user_cache(
+            |name| std::env::var(name).ok(),
+            &report,
+        )
     })
     .await
     {
@@ -655,6 +663,11 @@ pub async fn ensure_driver() -> Result<(PathBuf, PathBuf)> {
     }
 
     get_driver_executable()
+}
+
+/// [`ensure_driver_with`] for a caller that does not want progress.
+pub async fn ensure_driver() -> Result<(PathBuf, PathBuf)> {
+    ensure_driver_with(|_| {}).await
 }
 
 /// Whether a resolution failure should trigger the runtime download.
