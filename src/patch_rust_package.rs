@@ -116,6 +116,7 @@ fn main() {
     // The runtime driver download. Last, so every anchor below sees the tree
     // the earlier patches have already settled.
     patch_driver_download();
+    patch_driver_assembly_in_lib();
 }
 
 /// `evaluate` / `evaluate_handle` / `evaluate_all` run in an isolated world
@@ -510,5 +511,48 @@ fn patch_driver_download() {
         manifest,
         "default = [\"native-tls\", \"macros\", \"ring\", \"route-service\"]\n",
         "default = [\"native-tls\", \"macros\", \"ring\", \"route-service\", \"driver-download\"]\n",
+    );
+}
+
+/// Make the one assembly implementation reachable from the library.
+///
+/// `driver_assembly.rs` is already `include!`d by `build.rs` and the cli
+/// binary; the runtime download is its third caller, so it becomes a real
+/// module of the crate and its two entry points need crate visibility.
+///
+/// It `include!`s `driver_urls.rs` itself, so this also pulls a second copy of
+/// those pure mapping functions into `driver_assembly`. That is deliberate:
+/// dropping that `include!` would mean editing `build.rs` and the cli binary
+/// too, and the duplication is a handful of `match` arms with no state.
+fn patch_driver_assembly_in_lib() {
+    let assembly = &format!("{CRATE}/src/build_support/driver_assembly.rs");
+    patch(
+        assembly,
+        "#[allow(dead_code)]\nfn assemble_driver(",
+        "#[allow(dead_code)]\npub(crate) fn assemble_driver(",
+    );
+    patch(
+        assembly,
+        "#[allow(dead_code)]\nfn driver_complete(",
+        "#[allow(dead_code)]\npub(crate) fn driver_complete(",
+    );
+    insert_after(
+        &format!("{CRATE}/src/lib.rs"),
+        "#[path = \"build_support/driver_urls.rs\"]\nmod driver_urls;\n",
+        "
+// The runtime driver download (`driver-download`) assembles with the same
+// implementation the build script and the cli binary use; this is its third
+// compile point. Gated on the feature so a consumer that turns it off does
+// not carry the download stack.
+//
+// `allow(dead_code)` because the file `include!`s `driver_urls.rs` itself, so
+// the mapping functions it does not happen to call (`driver_dir_name`,
+// `cached_driver_dir`) have a second, unused copy here. Removing that
+// `include!` would mean editing `build.rs` and the cli binary as well.
+#[cfg(feature = \"driver-download\")]
+#[allow(dead_code)]
+#[path = \"build_support/driver_assembly.rs\"]
+mod driver_assembly;
+",
     );
 }
