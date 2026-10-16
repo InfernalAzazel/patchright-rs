@@ -117,6 +117,7 @@ fn main() {
     // the earlier patches have already settled.
     patch_driver_download();
     patch_driver_assembly_in_lib();
+    patch_driver_download_module();
 }
 
 /// `evaluate` / `evaluate_handle` / `evaluate_all` run in an isolated world
@@ -548,11 +549,36 @@ fn patch_driver_assembly_in_lib() {
 // `allow(dead_code)` because the file `include!`s `driver_urls.rs` itself, so
 // the mapping functions it does not happen to call (`driver_dir_name`,
 // `cached_driver_dir`) have a second, unused copy here. Removing that
-// `include!` would mean editing `build.rs` and the cli binary as well.
+// `include!` would mean editing `build.rs` and the cli binary as well. The
+// duplication carries that file's `#[cfg(test)]` module too, so its tests run
+// twice under `cargo test --lib`; they are pure mapping assertions, and the
+// alternative is a three-way edit of files this patch does not otherwise touch.
 #[cfg(feature = \"driver-download\")]
 #[allow(dead_code)]
 #[path = \"build_support/driver_assembly.rs\"]
 mod driver_assembly;
 ",
+    );
+}
+
+/// The module source for the runtime download.
+///
+/// Kept as its own file and pulled in with `include_str!` so an editor still
+/// highlights it as Rust, and so a refactor breaks one short anchor instead of
+/// a hundred lines of string literal.
+const DRIVER_DOWNLOAD_MODULE: &str = include_str!("driver_download_module.rs");
+
+/// The runtime driver download's module and its declaration.
+fn patch_driver_download_module() {
+    write(
+        &format!("{CRATE}/src/server/driver_download.rs"),
+        DRIVER_DOWNLOAD_MODULE,
+    );
+    // `driver` sits in the same parent module, so this stays crate-internal:
+    // the feature is a build-time choice, not public API.
+    insert_after(
+        &format!("{CRATE}/src/server/mod.rs"),
+        "pub mod driver;\n",
+        "#[cfg(feature = \"driver-download\")]\npub(crate) mod driver_download;\n",
     );
 }
