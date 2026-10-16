@@ -102,6 +102,7 @@ fn main() {
     patch_route();
     patch_inject_route();
     patch_dialog();
+    patch_no_console_window();
 
     // Stealth tests against the detection sites listed in the README
     write(
@@ -453,5 +454,30 @@ fn patch_dialog() {
                             };
                         }
 "#,
+    );
+}
+
+/// Suppress the console window Windows allocates for the Node driver.
+///
+/// `node.exe` is a console program. A host with no console of its own — a
+/// GUI-subsystem application, which is the normal shape for a Tauri app
+/// (`windows_subsystem = "windows"`) — makes Windows allocate a new console
+/// for the child, so a black window appears on every browser launch. Only
+/// seen there: a console host (CLI, test binary, `cargo run`) hands its own
+/// console down, so neither upstream's own use nor CI ever shows it.
+///
+/// `CREATE_NO_WINDOW` (0x0800_0000) suppresses the allocation, exactly as it
+/// does for any other child process. The `cmd` here is a
+/// `tokio::process::Command`, whose `creation_flags` is `#[cfg(windows)]`.
+fn patch_no_console_window() {
+    insert_after(
+        &format!("{CRATE}/src/server/playwright_server.rs"),
+        "let mut cmd = Command::new(&node_exe);",
+        r#"
+
+        // Windows allocates a console for this console-program child when the
+        // host has none (GUI-subsystem apps like Tauri); suppress it.
+        #[cfg(windows)]
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW"#,
     );
 }
