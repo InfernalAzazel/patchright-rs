@@ -119,6 +119,7 @@ fn main() {
     patch_driver_assembly_in_lib();
     patch_driver_download_module();
     patch_runtime_download();
+    patch_launch_uses_ensure_driver();
 }
 
 /// `evaluate` / `evaluate_handle` / `evaluate_all` run in an isolated world
@@ -716,5 +717,23 @@ pub(crate) fn download_failed_message(reason: &str) -> String {
     }
 
 "#,
+    );
+}
+
+/// Point the launch path at `ensure_driver`, which is what the function's own
+/// doc comment has claimed since before the download existed.
+fn patch_launch_uses_ensure_driver() {
+    let server = &format!("{CRATE}/src/server/playwright_server.rs");
+    // `get_driver_executable` is used here and nowhere else in this file, so
+    // this replaces the import: extending it would leave an unused one.
+    patch(
+        server,
+        "use crate::server::driver::get_driver_executable;",
+        "use crate::server::driver::ensure_driver;",
+    );
+    patch(
+        server,
+        "        // Get the driver executable paths\n        // The driver should already be downloaded by build.rs\n        let (node_exe, cli_js) = get_driver_executable()?;",
+        "        // Resolve the driver, assembling one into this machine's user cache\n        // if there is none: build.rs only ever ran on the build machine.\n        let (node_exe, cli_js) = ensure_driver().await?;",
     );
 }
