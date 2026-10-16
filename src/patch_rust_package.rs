@@ -118,6 +118,7 @@ fn main() {
     patch_driver_download();
     patch_driver_assembly_in_lib();
     patch_driver_download_module();
+    patch_runtime_download();
 }
 
 /// `evaluate` / `evaluate_handle` / `evaluate_all` run in an isolated world
@@ -580,5 +581,140 @@ fn patch_driver_download_module() {
         &format!("{CRATE}/src/server/mod.rs"),
         "pub mod driver;\n",
         "#[cfg(feature = \"driver-download\")]\npub(crate) mod driver_download;\n",
+    );
+}
+
+/// `ensure_driver`: the runtime download, gated so it only runs when the whole
+/// resolution chain missed.
+///
+/// It stays out of `get_driver_executable` (which is sync, cheap, and whose
+/// callers include browser installation): resolution there must not turn into a
+/// 100 MB download, and a misconfigured override must surface rather than be
+/// papered over by one.
+fn patch_runtime_download() {
+    let driver = &format!("{CRATE}/src/server/driver.rs");
+    insert_after(
+        driver,
+        "pub fn get_driver_executable() -> Result<(PathBuf, PathBuf)> {\n    resolve_driver(|name| std::env::var(name).ok())\n}\n",
+        r#"
+/// Locate the driver, assembling one into this machine's user cache first if
+/// there is none.
+///
+/// [`get_driver_executable`] covers a machine that built the crate: the build
+/// script assembled a driver there and the user cache is populated. A machine
+/// that only received a built binary has neither — the recorded path names the
+/// builder, and nothing ever ran the assembler here. This is the entry point
+/// for that case, and the only place the crate reaches the network at runtime.
+///
+/// Downloads only when resolution finds nothing at all. A driver override that
+/// is set but wrong stays an error: it is a misconfiguration, and fetching a
+/// driver would hide it.
+///
+/// # Errors
+///
+/// Whatever [`get_driver_executable`] returns, when it resolves or when the
+/// download is not attempted; [`Error::DriverDownloadFailed`] when the
+/// assembly was tried and failed, naming the failure and repeating the ways to
+/// provide a driver.
+pub async fn ensure_driver() -> Result<(PathBuf, PathBuf)> {
+    match get_driver_executable() {
+        Ok(found) => return Ok(found),
+        Err(e) if !should_download(&e) => return Err(e),
+        Err(_) => {}
+    }
+
+    #[cfg(feature = "driver-download")]
+    match tokio::task::spawn_blocking(|| {
+        crate::server::driver_download::assemble_into_user_cache(|name| std::env::var(name).ok())
+    })
+    .await
+    {
+        // Fetching and unpacking ~100 MB would otherwise hold a runtime worker
+        // for as long as it takes.
+        Ok(Ok(Some(dir))) => {
+            tracing::info!(
+                target: "patchright_rs::driver_download",
+                "no Playwright driver on this machine; assembled one at {}",
+                dir.display()
+            );
+        }
+        Ok(Ok(None)) => {}
+        Ok(Err(e)) => return Err(Error::DriverDownloadFailed(e.to_string())),
+        Err(e) => {
+            return Err(Error::DriverDownloadFailed(format!(
+                "the driver assembly task did not finish: {e}"
+            )));
+        }
+    }
+
+    get_driver_executable()
+}
+
+/// Whether a resolution failure should trigger the runtime download.
+///
+/// Only "nothing was found" does. A misconfiguration names the variable that is
+/// wrong and is the user's to fix; downloading past it would bury that.
+fn should_download(error: &Error) -> bool {
+    matches!(error, Error::ServerNotFound)
+}
+
+/// The text of [`Error::DriverDownloadFailed`]: what failed, then the same ways
+/// out [`Error::ServerNotFound`] lists.
+pub(crate) fn download_failed_message(reason: &str) -> String {
+    format!(
+        "Failed to download the Playwright driver: {reason}\n\n\
+        No driver was found on this machine and assembling one from the \
+        patchright-core and nodejs.org artifacts failed — no network access, a \
+        proxy, or a blocked host.\n\n{}",
+        BundledDriver::for_this_build().server_not_found_message()
+    )
+}
+"#,
+    );
+
+    // The error variant lives here, not with the feature: its `#[error]` calls
+    // `download_failed_message`, so the two have to land together or the crate
+    // does not compile. `Error` is `#[non_exhaustive]`, so adding a variant
+    // breaks no downstream `match`.
+    insert_after(
+        &format!("{CRATE}/src/error.rs"),
+        "    ServerNotFound,\n",
+        r#"
+    /// The runtime driver download failed.
+    ///
+    /// The crate tried to assemble a driver on this machine (see the
+    /// `driver-download` feature) and could not reach the artifacts. The
+    /// message names the failure and repeats the ways to provide a driver.
+    #[error("{}", crate::server::driver::download_failed_message(.0))]
+    DriverDownloadFailed(String),
+"#,
+    );
+
+    // The three-way decision is a pure function, so it gets a pure test; the
+    // async wrapper around it is straight-line code over tested parts.
+    insert_before(
+        driver,
+        "    fn install_args_request_system_deps_only_when_asked() {",
+        r#"    #[test]
+    fn only_a_missing_driver_triggers_the_runtime_download() {
+        assert!(should_download(&Error::ServerNotFound));
+        assert!(
+            !should_download(&Error::DriverMisconfigured("x".into())),
+            "a bad override must surface, not be papered over by a download"
+        );
+        assert!(!should_download(&Error::LaunchFailed("x".into())));
+    }
+
+    #[test]
+    fn the_download_failure_names_the_reason_and_the_ways_out() {
+        let message = download_failed_message("download of https://example.invalid failed");
+        assert!(message.starts_with("Failed to download the Playwright driver:"));
+        assert!(message.contains("https://example.invalid"));
+        for token in ["patchright-rs install", "PLAYWRIGHT_DRIVER_PATH"] {
+            assert!(message.contains(token), "must name {token}:\n{message}");
+        }
+    }
+
+"#,
     );
 }
