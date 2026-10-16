@@ -118,6 +118,7 @@ fn main() {
     patch_driver_download();
     patch_driver_assembly_in_lib();
     patch_driver_progress_types();
+    patch_driver_streaming_read();
     patch_driver_download_module();
     patch_runtime_download();
     patch_launch_uses_ensure_driver();
@@ -843,6 +844,96 @@ pub enum DriverProgress {
         assert_eq!(steps[1].clone(), steps[1]);
     }
 
+"#,
+    );
+}
+
+/// Read the download body in chunks, reporting the running total as it grows.
+///
+/// A pure function over `Read`, so it is unit-testable without a network: the
+/// point of pulling it out of `http_get` is that "does this stream, and does it
+/// report every chunk" becomes an assertion instead of a claim.
+///
+/// The bytes are still returned whole: unpacking needs the entire archive (the
+/// Windows Node dist is a *zip*, which needs `Seek`, so it cannot be consumed
+/// as it arrives). This buys visibility, not a smaller peak.
+fn patch_driver_streaming_read() {
+    insert_before(
+        &format!("{CRATE}/src/build_support/driver_assembly.rs"),
+        "/// Whether `driver_dir` holds the two files the runtime launches with.",
+        r#"/// How many bytes are read (and reported) at a time.
+#[allow(dead_code)]
+const DOWNLOAD_CHUNK: usize = 64 * 1024;
+
+/// Read `reader` to the end, handing the running byte count to `on_progress`
+/// after each chunk.
+#[allow(dead_code)]
+fn read_streaming(
+    reader: &mut impl std::io::Read,
+    on_progress: &mut impl FnMut(u64),
+) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let mut out = Vec::new();
+    let mut buf = [0u8; DOWNLOAD_CHUNK];
+    loop {
+        let read = reader.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..read]);
+        on_progress(out.len() as u64);
+    }
+    Ok(out)
+}
+
+"#,
+    );
+
+    // `driver_assembly.rs` is a lib module (its `#[cfg(test)]` runs under
+    // `cargo test --lib`, which is what the release workflow gates on), and it
+    // is also `include!`d by build.rs, where a test module compiles away.
+    insert_after(
+        &format!("{CRATE}/src/build_support/driver_assembly.rs"),
+        "    if !found_exe {\n        return Err(io::Error::other(format!(\n            \"Node archive did not contain {exe_inner}\"\n        )));\n    }\n    Ok(())\n}\n",
+        r#"
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    #[test]
+    fn streaming_read_reports_each_chunk_and_keeps_the_bytes_intact() {
+        let payload: Vec<u8> = (0..(DOWNLOAD_CHUNK * 2 + 7))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let mut reported = Vec::new();
+        let mut reader = std::io::Cursor::new(payload.clone());
+
+        let read = read_streaming(&mut reader, &mut |done| reported.push(done)).unwrap();
+
+        assert_eq!(read, payload, "the bytes must survive the chunked read");
+        assert!(
+            reported.len() >= 3,
+            "must report more than once, otherwise it is not streaming: {reported:?}"
+        );
+        assert_eq!(reported.last(), Some(&(payload.len() as u64)));
+        assert!(
+            reported.windows(2).all(|pair| pair[0] <= pair[1]),
+            "the running total must not go backwards: {reported:?}"
+        );
+    }
+
+    #[test]
+    fn streaming_read_of_an_empty_body_reports_nothing() {
+        let mut reported = Vec::new();
+        let mut reader = std::io::Cursor::new(Vec::<u8>::new());
+
+        let read = read_streaming(&mut reader, &mut |done| reported.push(done)).unwrap();
+
+        assert!(read.is_empty());
+        assert!(reported.is_empty(), "an empty body has no progress to report");
+    }
+}
 "#,
     );
 }
