@@ -14,6 +14,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::driver_urls::{DriverArtifact, DriverProgress};
+
 /// Assemble the driver into this machine's user cache when it is not already
 /// there. Returns the directory that now holds it.
 ///
@@ -22,13 +24,54 @@ use std::path::{Path, PathBuf};
 /// reports the resolution failure it already had.
 pub(crate) fn assemble_into_user_cache(
     env: impl Fn(&str) -> Option<String>,
+    report: &dyn Fn(DriverProgress),
 ) -> std::io::Result<Option<PathBuf>> {
     assemble_into_user_cache_with(
         env,
         baked_version_and_platform(),
         dirs::cache_dir(),
-        crate::driver_assembly::assemble_driver,
+        // `driver_assembly` `include!`s `driver_urls.rs`, so the `DriverProgress`
+        // its `http_get` reports is a *second*, distinct type from the one the
+        // public API names — the two enums are textually identical but not the
+        // same item. Bridge them here, the one place the two meet; every other
+        // `assemble` closure is a test double that ignores the reporter.
+        |driver_dir, version, platform, report| {
+            crate::driver_assembly::assemble_driver(driver_dir, version, platform, &|progress| {
+                report(public_progress(progress))
+            })
+        },
+        report,
     )
+}
+
+/// [`crate::driver_assembly`]'s own copy of `DriverProgress` → the public one.
+///
+/// The split exists only because the assembly body `include!`s `driver_urls.rs`
+/// instead of importing the module (it has to: `build.rs` and the cli binary
+/// have no module of that name). Exhaustive on purpose, so a new variant is a
+/// compile error here rather than a silently dropped step.
+fn public_progress(progress: crate::driver_assembly::DriverProgress) -> DriverProgress {
+    use crate::driver_assembly::{DriverArtifact as Assembly, DriverProgress as P};
+
+    let artifact = |artifact: Assembly| match artifact {
+        Assembly::Core => DriverArtifact::Core,
+        Assembly::Node => DriverArtifact::Node,
+    };
+    match progress {
+        P::Downloading {
+            artifact: which,
+            done,
+            total,
+        } => DriverProgress::Downloading {
+            artifact: artifact(which),
+            done,
+            total,
+        },
+        P::Extracting { artifact: which } => DriverProgress::Extracting {
+            artifact: artifact(which),
+        },
+        P::Assembled { dir } => DriverProgress::Assembled { dir },
+    }
 }
 
 /// The version and platform this build recorded.
@@ -49,12 +92,14 @@ fn baked_version_and_platform() -> Option<(&'static str, &'static str)> {
 ///
 /// `env` supplies the process environment; `recorded` stands in for the
 /// compile-time version/platform; `cache_root` is the user cache root (`None`
-/// where no home directory resolves); `assemble` performs the download.
+/// where no home directory resolves); `assemble` performs the download;
+/// `report` receives each progress step.
 pub(crate) fn assemble_into_user_cache_with(
     env: impl Fn(&str) -> Option<String>,
     recorded: Option<(&str, &str)>,
     cache_root: Option<PathBuf>,
-    assemble: impl Fn(&Path, &str, &str) -> std::io::Result<()>,
+    assemble: impl Fn(&Path, &str, &str, &dyn Fn(DriverProgress)) -> std::io::Result<()>,
+    report: &dyn Fn(DriverProgress),
 ) -> std::io::Result<Option<PathBuf>> {
     // Exported-but-empty counts as unset, the convention `build.rs` and
     // `super::driver` both use.
@@ -70,7 +115,7 @@ pub(crate) fn assemble_into_user_cache_with(
     if crate::driver_assembly::driver_complete(&driver_dir, platform) {
         return Ok(Some(driver_dir));
     }
-    assemble(&driver_dir, version, platform)?;
+    assemble(&driver_dir, version, platform, report)?;
     Ok(Some(driver_dir))
 }
 
@@ -102,7 +147,7 @@ mod tests {
         // Also keeps `assemble_into_user_cache` exercised: it is the only
         // caller of the injected form below, and nothing else reaches it until
         // `ensure_driver` does.
-        assert!(assemble_into_user_cache(skip_knob).unwrap().is_none());
+        assert!(assemble_into_user_cache(skip_knob, &|_| {}).unwrap().is_none());
     }
 
     #[test]
@@ -114,10 +159,11 @@ mod tests {
             skip_knob,
             Some(("1.0.0", "linux")),
             Some(temp.path().into()),
-            |_, _, _| {
+            |_, _, _, _| {
                 calls.set(calls.get() + 1);
                 Ok(())
             },
+            &|_| {},
         )
         .unwrap();
 
@@ -134,10 +180,11 @@ mod tests {
             env,
             Some(("1.0.0", "linux")),
             Some(temp.path().into()),
-            |dir, _, platform| {
+            |dir, _, platform, _| {
                 fake_driver(dir, platform);
                 Ok(())
             },
+            &|_| {},
         )
         .unwrap();
 
@@ -149,20 +196,20 @@ mod tests {
         // `Fn` and `Copy`: captures a `&Cell`, so it can be handed to both
         // calls without borrowing mutably.
         let calls = Cell::new(0);
-        let assemble = |_: &Path, _: &str, _: &str| {
+        let assemble = |_: &Path, _: &str, _: &str, _: &dyn Fn(DriverProgress)| {
             calls.set(calls.get() + 1);
             Ok(())
         };
         let temp = tempfile::tempdir().unwrap();
 
         assert!(
-            assemble_into_user_cache_with(no_env, Some(("1.0.0", "linux")), None, assemble)
+            assemble_into_user_cache_with(no_env, Some(("1.0.0", "linux")), None, assemble, &|_| {})
                 .unwrap()
                 .is_none(),
             "no cache root means no destination"
         );
         assert!(
-            assemble_into_user_cache_with(no_env, None, Some(temp.path().into()), assemble)
+            assemble_into_user_cache_with(no_env, None, Some(temp.path().into()), assemble, &|_| {})
                 .unwrap()
                 .is_none(),
             "no recorded version/platform means no destination"
@@ -179,11 +226,12 @@ mod tests {
             no_env,
             Some(("1.63.0", "mac-arm64")),
             Some(temp.path().into()),
-            |dir, _, platform| {
+            |dir, _, platform, _| {
                 seen.set(Some(dir.to_path_buf()));
                 fake_driver(dir, platform);
                 Ok(())
             },
+            &|_| {},
         )
         .unwrap()
         .unwrap();
@@ -206,10 +254,11 @@ mod tests {
             no_env,
             Some(("1.63.0", "linux")),
             Some(temp.path().into()),
-            |_, _, _| {
+            |_, _, _, _| {
                 calls.set(calls.get() + 1);
                 Ok(())
             },
+            &|_| {},
         )
         .unwrap()
         .unwrap();
@@ -225,11 +274,12 @@ mod tests {
             no_env,
             Some(("1.63.0", "linux")),
             Some(temp.path().into()),
-            |_, _, _| {
+            |_, _, _, _| {
                 Err(std::io::Error::other(
                     "download of https://example.invalid failed",
                 ))
             },
+            &|_| {},
         )
         .unwrap_err();
 

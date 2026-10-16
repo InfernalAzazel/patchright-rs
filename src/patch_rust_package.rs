@@ -119,6 +119,9 @@ fn main() {
     patch_driver_assembly_in_lib();
     patch_driver_progress_types();
     patch_driver_streaming_read();
+    patch_driver_http_timeouts();
+    patch_driver_http_get();
+    patch_driver_assemble_report();
     patch_driver_download_module();
     patch_runtime_download();
     patch_launch_uses_ensure_driver();
@@ -629,7 +632,7 @@ pub async fn ensure_driver() -> Result<(PathBuf, PathBuf)> {
 
     #[cfg(feature = "driver-download")]
     match tokio::task::spawn_blocking(|| {
-        crate::server::driver_download::assemble_into_user_cache(|name| std::env::var(name).ok())
+        crate::server::driver_download::assemble_into_user_cache(|name| std::env::var(name).ok(), &|_| {})
     })
     .await
     {
@@ -933,5 +936,241 @@ mod progress_tests {
     }
 }
 "#,
+    );
+
+    insert_after(
+        &format!("{CRATE}/src/build_support/driver_assembly.rs"),
+        "        assert!(reported.is_empty(), \"an empty body has no progress to report\");\n    }\n}\n",
+        r#"
+#[cfg(test)]
+mod report_tests {
+    use super::*;
+
+    #[test]
+    fn a_panicking_report_does_not_escape() {
+        // A caller's panic must not become a `JoinError` in `ensure_driver`,
+        // which would report a *successful* assembly as a failed one.
+        report_safely(&|_| panic!("caller bug"), DriverProgress::Extracting {
+            artifact: DriverArtifact::Core,
+        });
+    }
+
+    #[test]
+    fn a_report_sees_every_step_it_is_given() {
+        use std::sync::Mutex;
+        let seen = Mutex::new(Vec::new());
+        let report = |progress: DriverProgress| seen.lock().unwrap().push(progress);
+
+        report_safely(&report, DriverProgress::Assembled {
+            dir: std::path::PathBuf::from("/c/driver"),
+        });
+        report_safely(&report, DriverProgress::Extracting {
+            artifact: DriverArtifact::Node,
+        });
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(matches!(seen[0], DriverProgress::Assembled { .. }));
+    }
+}
+"#,
+    );
+}
+
+/// Bound the connection (and TLS handshake) instead of waiting forever.
+fn patch_driver_http_timeouts() {
+    insert_before(
+        &format!("{CRATE}/src/build_support/driver_assembly.rs"),
+        "/// How many bytes are read (and reported) at a time.",
+        r#"/// Give up on establishing the connection (including DNS and the TLS
+/// handshake). ureq's default is `None`, i.e. wait forever.
+#[allow(dead_code)]
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Give up on the response headers.
+#[allow(dead_code)]
+const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Backstop for reading the whole body.
+///
+/// This is ureq's *total* budget for the body and it does not restart per read,
+/// so it cannot be a stall detector: 122 MB on a 1 Mbps line needs 16 minutes,
+/// and a tighter value would kill a slow-but-working download. It exists so a
+/// hung transfer eventually fails instead of hanging the first launch forever.
+#[allow(dead_code)]
+const BODY_BUDGET: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+"#,
+    );
+
+    insert_before(
+        &format!("{CRATE}/src/build_support/driver_assembly.rs"),
+        "/// How many bytes are read (and reported) at a time.",
+        r#"/// Call a downstream reporter without letting its panic escape.
+///
+/// The reporter runs on the `spawn_blocking` thread; a panic there surfaces as
+/// a `JoinError`, which `ensure_driver` reads as "the assembly task did not
+/// finish" and reports a *successful* assembly as a failure. `AssertUnwindSafe`
+/// is deliberate: the closure's state is dropped and never observed again.
+#[allow(dead_code)]
+fn report_safely(report: &dyn Fn(DriverProgress), progress: DriverProgress) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| report(progress)));
+}
+
+"#,
+    );
+}
+
+/// Rewrite `http_get` to stream the body and report each chunk.
+fn patch_driver_http_get() {
+    patch(
+        &format!("{CRATE}/src/build_support/driver_assembly.rs"),
+        r#"/// GET `url` fully into memory (driver artifacts are tens of MB; ureq's
+/// default 10 MB body cap is lifted). Errors carry the URL.
+#[allow(dead_code)]
+fn http_get(url: &str) -> std::io::Result<Vec<u8>> {
+    use std::io;
+    use std::sync::Arc;
+
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::Rustls)
+                .unversioned_rustls_crypto_provider(Arc::new(tls_crypto_provider()))
+                .build(),
+        )
+        .build()
+        .into();
+
+    let mut response = agent
+        .get(url)
+        .call()
+        .map_err(|e| io::Error::other(format!("download of {url} failed: {e}")))?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(io::Error::other(format!(
+            "download of {url} failed with status {status}"
+        )));
+    }
+    response
+        .body_mut()
+        .with_config()
+        .limit(u64::MAX)
+        .read_to_vec()
+        .map_err(|e| io::Error::other(format!("reading {url} failed: {e}")))
+}
+"#,
+        r#"/// GET `url` into memory, reporting progress as the body arrives.
+///
+/// The artifacts are tens of MB, so the body is read in chunks (see
+/// [`read_streaming`]) and every chunk is handed to `report`. The bytes are
+/// still buffered whole because unpacking needs them: the Windows Node dist is
+/// a zip and needs `Seek`. Errors carry the URL.
+///
+/// The timeouts are not optional: ureq's defaults are all `None` (wait
+/// forever), which turns a stalled transfer into a first launch that never
+/// finishes and never fails. See [`BODY_BUDGET`] for why the body bound is
+/// loose rather than a stall detector.
+#[allow(dead_code)]
+fn http_get(
+    url: &str,
+    artifact: DriverArtifact,
+    report: &dyn Fn(DriverProgress),
+) -> std::io::Result<Vec<u8>> {
+    use std::io;
+    use std::sync::Arc;
+
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::Rustls)
+                .unversioned_rustls_crypto_provider(Arc::new(tls_crypto_provider()))
+                .build(),
+        )
+        .timeout_connect(Some(CONNECT_TIMEOUT))
+        .timeout_recv_response(Some(RESPONSE_TIMEOUT))
+        .timeout_recv_body(Some(BODY_BUDGET))
+        .build()
+        .into();
+
+    let mut response = agent
+        .get(url)
+        .call()
+        .map_err(|e| io::Error::other(format!("download of {url} failed: {e}")))?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(io::Error::other(format!(
+            "download of {url} failed with status {status}"
+        )));
+    }
+
+    let total = response.body_mut().content_length();
+    report_safely(
+        report,
+        DriverProgress::Downloading {
+            artifact,
+            done: 0,
+            total,
+        },
+    );
+
+    let body = response.body_mut();
+    let mut on_chunk = |done: u64| {
+        report_safely(
+            report,
+            DriverProgress::Downloading {
+                artifact,
+                done,
+                total,
+            },
+        );
+    };
+    let bytes = read_streaming(&mut body.as_reader(), &mut on_chunk)
+        .map_err(|e| io::Error::other(format!("reading {url} failed: {e}")))?;
+    Ok(bytes)
+}
+"#,
+    );
+}
+
+/// Thread the progress reporter down to the one assembly implementation.
+///
+/// `assemble_driver` is the single downloader; `build.rs` and the cli binary
+/// `include!` it and want no progress, so they pass a no-op. The lib is the
+/// third caller and passes the caller's reporter through
+/// `assemble_into_user_cache`.
+///
+/// Must run after `patch_driver_assembly_in_lib`, which is what makes this
+/// function `pub(crate)`: the anchor below names the patched signature.
+fn patch_driver_assemble_report() {
+    let assembly = &format!("{CRATE}/src/build_support/driver_assembly.rs");
+    patch(
+        assembly,
+        "pub(crate) fn assemble_driver(\n    driver_dir: &std::path::Path,\n    driver_version: &str,\n    platform: &str,\n) -> std::io::Result<()> {",
+        "pub(crate) fn assemble_driver(\n    driver_dir: &std::path::Path,\n    driver_version: &str,\n    platform: &str,\n    report: &dyn Fn(DriverProgress),\n) -> std::io::Result<()> {",
+    );
+    patch(
+        assembly,
+        "    let result = (|| {\n        extract_npm_package(&http_get(&npm_core_url(driver_version))?, &tmp)?;\n        extract_node_binary(\n            &http_get(&node_archive_url(NODE_VERSION, triple))?,\n            NODE_VERSION,\n            triple,\n            &tmp,\n        )?;\n",
+        "    let result = (|| {\n        let core = http_get(&npm_core_url(driver_version), DriverArtifact::Core, report)?;\n        report_safely(\n            report,\n            DriverProgress::Extracting {\n                artifact: DriverArtifact::Core,\n            },\n        );\n        extract_npm_package(&core, &tmp)?;\n\n        let node = http_get(\n            &node_archive_url(NODE_VERSION, triple),\n            DriverArtifact::Node,\n            report,\n        )?;\n        report_safely(\n            report,\n            DriverProgress::Extracting {\n                artifact: DriverArtifact::Node,\n            },\n        );\n        extract_node_binary(&node, NODE_VERSION, triple, &tmp)?;\n",
+    );
+    // Every success path ends with a complete driver, including the one where
+    // another process won the race.
+    patch(
+        assembly,
+        "    if driver_complete(driver_dir, platform) {\n        let _ = std::fs::remove_dir_all(&tmp);\n        return Ok(());\n    }\n    match std::fs::rename(&tmp, driver_dir) {\n        Ok(()) => Ok(()),\n        Err(_) if driver_complete(driver_dir, platform) => {\n            let _ = std::fs::remove_dir_all(&tmp);\n            Ok(())\n        }\n        Err(e) => Err(e),\n    }\n}",
+        "    if driver_complete(driver_dir, platform) {\n        let _ = std::fs::remove_dir_all(&tmp);\n        report_safely(\n            report,\n            DriverProgress::Assembled {\n                dir: driver_dir.to_path_buf(),\n            },\n        );\n        return Ok(());\n    }\n    match std::fs::rename(&tmp, driver_dir) {\n        Ok(()) => {\n            report_safely(\n                report,\n                DriverProgress::Assembled {\n                    dir: driver_dir.to_path_buf(),\n                },\n            );\n            Ok(())\n        }\n        Err(_) if driver_complete(driver_dir, platform) => {\n            let _ = std::fs::remove_dir_all(&tmp);\n            report_safely(\n                report,\n                DriverProgress::Assembled {\n                    dir: driver_dir.to_path_buf(),\n                },\n            );\n            Ok(())\n        }\n        Err(e) => Err(e),\n    }\n}",
+    );
+
+    // The two callers that want no progress.
+    patch(
+        &format!("{CRATE}/build.rs"),
+        "match assemble_driver(&driver_dir, PLAYWRIGHT_VERSION, platform) {",
+        "match assemble_driver(&driver_dir, PLAYWRIGHT_VERSION, platform, &|_| {}) {",
+    );
+    patch(
+        &format!("{CRATE}/src/bin/patchright_rs.rs"),
+        "assemble_driver(&driver_dir, version, platform)?;",
+        "assemble_driver(&driver_dir, version, platform, &|_| {})?;",
     );
 }
