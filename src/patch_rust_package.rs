@@ -117,6 +117,7 @@ fn main() {
     // the earlier patches have already settled.
     patch_driver_download();
     patch_driver_assembly_in_lib();
+    patch_driver_progress_types();
     patch_driver_download_module();
     patch_runtime_download();
     patch_launch_uses_ensure_driver();
@@ -757,6 +758,91 @@ fn patch_changelog() {
 ### Changed
 
 - **A machine with no driver now reaches the network on first launch.** Up to ~100 MB (a Node runtime and the `patchright-core` tarball) is fetched once per machine and cached under the user cache directory. The download runs off a tokio worker (`spawn_blocking`), and an assembly that fails leaves the launch failing as it did before, with the reason attached.
+"#,
+    );
+}
+
+/// The progress a caller can observe while a driver is assembled.
+///
+/// The types live in `driver_urls.rs` because that file is the one all three
+/// compile points share (`build.rs` and the cli binary `include!` it, the lib
+/// declares it as a module), so one definition reaches the build script, the
+/// cli, and the lib's public API. They are `pub` there, not `pub(crate)`:
+/// re-exporting a `pub(crate)` item publicly is E0365.
+fn patch_driver_progress_types() {
+    insert_before(
+        &format!("{CRATE}/src/build_support/driver_urls.rs"),
+        "/// npm registry URL of the `playwright-core` tarball for a driver version.",
+        r#"/// Which of the two artifacts an assembly step is working on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverArtifact {
+    /// The `patchright-core` npm tarball (the driver itself).
+    Core,
+    /// The pinned Node.js runtime the driver runs on.
+    Node,
+}
+
+/// A step of the driver assembly, reported as it happens.
+///
+/// `total` is `None` when the response carried no usable length, so a caller
+/// must render "unknown total" rather than assume a percentage is available.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DriverProgress {
+    /// Body bytes received so far, and the total if it is known.
+    Downloading {
+        artifact: DriverArtifact,
+        done: u64,
+        total: Option<u64>,
+    },
+    /// The download finished; unpacking it now.
+    Extracting { artifact: DriverArtifact },
+    /// The driver is in place at `dir`.
+    Assembled { dir: std::path::PathBuf },
+}
+
+"#,
+    );
+
+    // The re-export is what makes the types nameable from a downstream crate;
+    // the module itself is private to the lib.
+    insert_after(
+        &format!("{CRATE}/src/server/driver.rs"),
+        "use crate::{Error, Result};\n",
+        "pub use crate::driver_urls::{DriverArtifact, DriverProgress};\n",
+    );
+
+    insert_before(
+        &format!("{CRATE}/src/server/driver.rs"),
+        "    #[test]\n    fn install_args_request_system_deps_only_when_asked() {",
+        r#"    #[test]
+    fn the_progress_types_are_reachable_from_the_public_api() {
+        // Naming every variant through the re-export is the assertion: it is
+        // how a downstream crate learns about progress at all.
+        let steps = [
+            DriverProgress::Downloading {
+                artifact: DriverArtifact::Core,
+                done: 0,
+                total: None,
+            },
+            DriverProgress::Extracting {
+                artifact: DriverArtifact::Core,
+            },
+            DriverProgress::Downloading {
+                artifact: DriverArtifact::Node,
+                done: 1,
+                total: Some(2),
+            },
+            DriverProgress::Extracting {
+                artifact: DriverArtifact::Node,
+            },
+            DriverProgress::Assembled {
+                dir: std::path::PathBuf::from("/c/driver"),
+            },
+        ];
+        assert_eq!(steps.len(), 5);
+        assert_eq!(steps[1].clone(), steps[1]);
+    }
+
 "#,
     );
 }
