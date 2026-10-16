@@ -872,8 +872,6 @@ fn read_streaming(
     reader: &mut impl std::io::Read,
     on_progress: &mut impl FnMut(u64),
 ) -> std::io::Result<Vec<u8>> {
-    use std::io::Read;
-
     let mut out = Vec::new();
     let mut buf = [0u8; DOWNLOAD_CHUNK];
     loop {
