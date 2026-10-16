@@ -1,0 +1,82 @@
+# asbuilt surveys this repo into docs/architecture/model.c4. `asbuilt
+# check` runs in the pre-commit hook and in CI, so the model cannot
+# drift from the code without a red gate saying so.
+
+# The release every survey runs with: a model is only meaningful against one,
+# so any other refuses to run and names the install line. CI installs from
+# this pin (the padamson/asbuilt action reads it), so a bump is this line and
+# a re-survey in the same commit.
+asbuilt = "0.3.0"
+
+[output]
+path = "docs/architecture/model.c4"
+
+[docs]
+# The tree is the landing site's Architecture section, mounted at
+# architecture/ in every version snapshot: the crumbs read
+# playwright-rust / Architecture / <crate>, and the first one links back to
+# the snapshot root, relative so it holds under /dev/ and /vX.Y.Z/.
+title = "Architecture"
+home_url = "../"
+home_title = "playwright-rust"
+source_url = "https://github.com/padamson/playwright-rust/blob/main/"
+# The site's page colors, served from the snapshot root beside the tree
+# (crates/site/architecture.css, copied there by Trunk).
+stylesheet = "../architecture.css"
+# The landing site is dark-only, so the tree opens dark to match; the
+# System / Light / Dark control in every page's header still lets a visitor
+# change it, and the choice is remembered across the tree.
+color_scheme = "dark"
+
+# The site's ink-and-rust palette on every element kind: white module
+# cards, rust crates and tan external processes on a light page; warm
+# brown cards and a deeper rust on the site's ink in the dark. The docs
+# pages switch between the two; the rendered SVG files use the light set.
+[theme]
+component = { light = "#ffffff", dark = "#3d2c22" }
+container = { light = "#ce422b", dark = "#8f2d19" }
+process = { light = "#e9d4c8", dark = "#2f2620" }
+# The non-library targets, set apart from modules: a bin in a pale rust,
+# since it is an entry point; tests and examples in quieter warm neutrals.
+bin = { light = "#f6ddd4", dark = "#5a2e20" }
+tests = { light = "#efe8e2", dark = "#2a211b" }
+examples = { light = "#fbf1e4", dark = "#3a3022" }
+
+[rust]
+# Three crates live in the repo but outside the workspace, each with its
+# own lockfile: the wasm32 landing page, its native dogfood test, and the
+# fuzz targets. They are still part of the architecture.
+extra_manifests = [
+    "crates/site/Cargo.toml",
+    "crates/site-e2e/Cargo.toml",
+    "crates/playwright/fuzz/Cargo.toml",
+]
+
+[[externals]]
+id = "node_driver"
+kind = "process"
+title = "Playwright driver"
+technology = "Node.js process"
+description = "The official Playwright server, assembled by build.rs from the pinned playwright-core npm package."
+
+[[externals.relations]]
+from = "playwright_rs.server.playwright_server"
+title = "spawns"
+technology = "stdio"
+
+[[externals.relations]]
+from = "playwright_rs.server.transport"
+title = "exchanges JSON-RPC frames with"
+technology = "stdio pipe or WebSocket"
+
+[[externals]]
+id = "browsers"
+kind = "process"
+title = "Browsers"
+technology = "Chromium, Firefox, WebKit"
+description = "The browser processes the driver launches and controls; never spoken to directly from Rust."
+
+[[externals.relations]]
+from = "node_driver"
+title = "drives"
+technology = "CDP, Juggler, WebKit protocol"

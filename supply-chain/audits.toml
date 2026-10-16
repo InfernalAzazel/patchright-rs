@@ -1,0 +1,627 @@
+
+# cargo-vet audits file
+
+[[audits.base64]]
+who = "Paul Adamson <paul.adamson.01@gmail.com>"
+criteria = "safe-to-deploy"
+delta = "0.22.1 -> 0.23.1"
+notes = "Delta is edition/MSRV housekeeping plus the new simd-unsafe feature (on by default): AVX2/NEON base64 kernels (Mula-Lemire algorithm) selected via runtime CPU feature detection. All unsafe is confined to src/engine/simd.rs intrinsics with loop-guard bounds checks before every load/store; invalid input falls back to the scalar decoder for exact error reporting. No new dependencies, no build script, no fs/net/process/env access. SIMD engines run the same property-test suite as the scalar engine."
+
+[[audits.dirs]]
+who = "Paul Adamson <paul.adamson.01@gmail.com>"
+criteria = "safe-to-deploy"
+delta = "6.0.0 -> 7.0.0"
+notes = "One source change, in src/win.rs: preference_dir on Windows now returns the roaming AppData folder (known_folder_roaming_app_data) instead of the local one, matching its documentation and the directories crate; every other function is untouched. This crate calls only cache_dir, which is unchanged on every platform. The rest of the delta is packaging: the repository URL moves from GitHub to codeberg.org, the maintenance badge leaves Cargo.toml, README links follow. No unsafe, no build script, no dependency changes."
+
+[[audits.http-range-header]]
+who = "Paul Adamson <paul.adamson.01@gmail.com>"
+criteria = "safe-to-run"
+delta = "0.3.1 -> 0.4.2"
+notes = "Dev-dependency via tower-http's fs feature. Pure parser refactor: the string-message error and its with_error_cause feature become a Copy enum, two split helpers become str::split_once, file-size subtractions become saturating_sub, and the range types go pub. No unsafe, no dependencies, no build script, no I/O."
+
+[[audits.miniz_oxide]]
+who = "Paul Adamson <paul.adamson.01@gmail.com>"
+criteria = "safe-to-deploy"
+delta = "0.8.9 -> 0.9.1"
+notes = "Pulled in by flate2 1.1.10. The crate keeps #![forbid(unsafe_code)] (the only 'unsafe' hits are comments), has no build script, and adds no dependencies: serde goes default-features = false with alloc, and the simd-adler32 floor moves 0.3.3 -> 0.3.8. No fs/net/process/env access in either version. Deflate side: new TDEFLFlush variants (Partial, PartialOpt, SyncOpt, NoSync) and #[non_exhaustive] on the public enums; CompressorOxide::with_params clamps window_bits to 15 and level to 10, and the zlib header now derives CINFO from window_bits with saturating_sub; flush_block skips emitting an empty block unless finishing; the stored-block path stops feeding the hash chain; SMALL_DIST_EXTRA shrinks to 128 entries indexed by match_dist >> 2, which stays in bounds because the branch is guarded by match_dist < 512. Two assert!(lookahead_size >= len_to_move) become debug_assert!; that is an internal invariant, and every downstream dict index is masked by LZ_DICT_SIZE_MASK, so a violation could corrupt output but not escape bounds. Inflate side: Huffman table validation is stricter (rejects over-subscribed tables step by step, matching zlib inftrees.c) and the incomplete-table rule is restated per RFC 1951; decompress_with_limit adds an out_max that OutputBuffer computes with saturating_add and clamps to the slice length, and the back-reference bounds check now uses that limit. wasm32 boxes the LZ code buffer. Remaining changes are docs, const fn, and Clone derives."
+
+[[audits.rustls]]
+who = "Paul Adamson <paul.adamson.01@gmail.com>"
+criteria = "safe-to-deploy"
+delta = "0.23.42 -> 0.23.43"
+notes = "Defensive hardening release. Threads Protocol (Tcp/Quic) through supports_version and find_cipher_suite so a QUIC connection cannot negotiate a TLS1.2-only suite. Replaces two attacker-reachable subtractions on handshake input with saturating_sub (encoding_for_binder_signing, and the server TLS1.3 binder plaintext slice), removing a panic path on a malformed ClientHello. Replaces an as-cast multiply on session ticket age with checked conversion. No new unsafe, no new ambient capabilities, no I/O changes."
+
+[[audits.rustls]]
+who = "Paul Adamson <paul.adamson.01@gmail.com>"
+criteria = "safe-to-deploy"
+delta = "0.23.43 -> 0.23.44"
+notes = "SignatureScheme::algorithm() now returns Option so schemes with no TLS1.2 SignatureAlgorithm (ML-DSA) are filtered out of the TLS1.2 ClientHello signature_schemes, CertificateRequest handling and server-side client-auth verify schemes; a ServerKeyExchange signed with such a scheme is rejected with an IllegalParameter alert, and verify_tls12_signature rejects it up front, where 0.23.43 fell through as Unknown(0). Adds ML-DSA signing keys under aws-lc-rs (PqdsaSigningKey, signature length checked against the algorithm). On ECH rejection the client now authenticates the outer public_name per RFC 9849 instead of the inner name. PayloadU24 gains a cardinality marker so a zero-length OCSP response is rejected at decode. SSLKEYLOGFILE is now created with mode 0o600 on Unix, the only ambient-capability change and a tightening. No new unsafe."
+
+[[audits.rustls]]
+who = "Paul Adamson <paul.adamson.01@gmail.com>"
+criteria = "safe-to-deploy"
+delta = "0.23.44 -> 0.23.45"
+notes = "Fix for RUSTSEC-2026-0285. HandshakeDeframer::is_aligned now reports aligned only when no handshake span is pending, complete or partial, and ConnectionCore records that after every handshake message it takes, so a handshake message packed into the same record as a key change is rejected as RFC 8446 section 5.1 requires. Server HelloRetryRequest hardening per RFC 9846: the second ClientHello must keep the retried cipher suite and may not withdraw a PSK offer, and TLS 1.2 is no longer offered after a retry (two new PeerMisbehaved variants, each with a unit test). Private keys handed to KeyProvider::load_private_key are wrapped in Zeroizing. No unsafe, no new dependencies."
+
+[[audits.rustls-webpki]]
+who = "Paul Adamson <paul.adamson.01@gmail.com>"
+criteria = "safe-to-deploy"
+delta = "0.103.13 -> 0.103.15"
+notes = "Promotes ML-DSA-44/65/87 verification from the aws-lc-rs-unstable feature to plain aws-lc-rs (aws-lc-rs 1.14 -> 1.18 now ships them as stable) and drops the per-algorithm in_fips_submission flag, so fips() reports aws-lc-rs's own FIPS mode; base64 0.22 -> 0.23. The one logic edit is find_serial in crl/types.rs rewritten with ? for the same control flow. No unsafe, no build script, no new ambient capabilities."
+
+[[audits.ureq]]
+who = "Paul Adamson <paul.adamson.01@gmail.com>"
+criteria = "safe-to-deploy"
+delta = "3.3.0 -> 3.4.0"
+notes = "No new unsafe (the crate has none in either version), no build script, no new ambient capabilities. The TLS delta is two lines: rustls.rs and native_tls.rs switch .host() to .host_bare() so RFC 3986 bracketed IPv6 literals are stripped before use as SNI/ServerName, which rustls rejects in bracketed form; host_bare strips only a leading [ and trailing ], leaving DNS and IPv4 authorities untouched, and is covered by new unit tests. Remaining changes match the changelog: HTTPS CONNECT proxy support and canonical Basic auth scheme for CONNECT (connect.rs), a max_idle_age pooling fix, sealing RequestExt, and rustls-platform-verifier 0.6 -> 0.7. One disable_verification(true) is added but sits inside #[cfg(test)] behind the private _test/_ring features, exercising the new proxy path against a self-signed fixture; it is not reachable from shipped code."
+
+[[audits.ureq]]
+who = "Paul Adamson <paul.adamson.01@gmail.com>"
+criteria = "safe-to-deploy"
+delta = "3.4.0 -> 3.4.1"
+notes = 'No unsafe, no build script, no new deps beyond ureq-proto 0.6.2. The TLS handshake now completes inside connect() (rustls complete_io; native-tls drops its LazyStream deferral) so timeout_connect covers it. Timeout budgets: each phase starts from the latest completed predecessor instead of chaining every earlier phase, and an already-expired budget fails in Connection::transmit_output/maybe_await_input instead of getting a per-call socket grace period. The pool refuses to reuse a connection with unconsumed buffered input (server sent more than Content-Length), which closes a response-desync path. read_json buffers bodies whose Content-Length is under a third of the read limit and parses from the slice, still bounded by that limit. The std::net::TcpListener use is a cfg(not(feature = "_test")) unit test on 127.0.0.1; disable_verification(true) appears only under cfg(test).'
+
+[[audits.ureq]]
+who = "Paul Adamson <paul.adamson.01@gmail.com>"
+criteria = "safe-to-deploy"
+delta = "3.4.1 -> 3.4.2"
+notes = "No unsafe, no build script, no new deps beyond ureq-proto 0.6.3. Request-level configs whose connection settings differ from the Agent's (IP family, TCP_NODELAY, buffer sizes, User-Agent since it goes into proxy CONNECT, or any TLS field) now bypass the pool both ways: Config::can_share_pool_with and TlsConfig::can_share_pool_with destructure exhaustively so a new field forces a decision, TLS client certs, specific root sets and rustls crypto providers compare by Arc identity so independently built credentials never share a connection, and a bypassing connection gets a Weak::new() pool handle so it is neither borrowed from nor returned to the pool. This closes a path where a per-request TLS override could be served by a connection established under the Agent's TLS settings. TCP connect moves on to the next resolved address on HostUnreachable, NetworkUnreachable and AddrNotAvailable (plus WSAEACCES on Windows) in addition to ConnectionRefused, and reports the last real error instead of a synthesized refusal; other io errors still stop. The disable_verification(true) and client-cert constructions in the diff are all under cfg(test) against a synthetic transport."
+
+[[audits.ureq-proto]]
+who = "Paul Adamson <paul.adamson.01@gmail.com>"
+criteria = "safe-to-deploy"
+delta = "0.6.0 -> 0.6.1"
+notes = "No source changes whatsoever. The delta is a newly added LICENSE-APACHE.txt (which accounts for nearly all of the reported line count), packaging metadata, and a base64 0.22.1 -> 0.23.1 dependency bump that is already audited in this file."
+
+[[audits.ureq-proto]]
+who = "Paul Adamson <paul.adamson.01@gmail.com>"
+criteria = "safe-to-deploy"
+delta = "0.6.1 -> 0.6.2"
+notes = "Hardening of received-header parsing; no unsafe, no new deps. Content-Length is read from every header line as a comma list: each element must be plain digits (a sign, inner whitespace, an empty element or u64 overflow is BadContentLengthHeader) and repeated values must agree, differing values are TooManyContentLengthHeaders, with no first- or last-wins. Outgoing requests and responses reject a signed or list-valued Content-Length before it reaches the wire. A status code below 100 from httparse is now HttpParseFail instead of an unwrap panic, or unwrap_or_default's bogus 200 on the partial-response path. The partial-response header scan stops on an empty name rather than an empty value, so a Location after an empty header is no longer dropped. Connection and Expect token matching is comma-list and ASCII case-insensitive per RFC 9110."
+
+[[audits.ureq-proto]]
+who = "Paul Adamson <paul.adamson.01@gmail.com>"
+criteria = "safe-to-deploy"
+delta = "0.6.2 -> 0.6.4"
+notes = "No unsafe, no build script, no new deps. Redirect Location joining gains the RFC 3986 network-path case: a Location starting with // takes the base's scheme and its own authority, failing with BadLocationHeader when the base has no scheme or the result does not parse, so a scheme-relative redirect no longer resolves as a root-relative path on the old host. ArrayVec gains Clone, PartialEq/Eq over the active prefix, Default, and a try_push that returns CapacityError instead of indexing past the array; push itself is unchanged and now documents its panic. CapacityError is exported doc(hidden). Everything else is unit tests."
+
+[[trusted.aho-corasick]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2019-03-28"
+end = "2027-05-16"
+
+[[trusted.anstream]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2023-03-16"
+end = "2027-05-16"
+
+[[trusted.anstyle]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2022-05-18"
+end = "2027-05-16"
+
+[[trusted.anstyle-parse]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2023-03-08"
+end = "2027-05-16"
+
+[[trusted.anstyle-query]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2023-04-13"
+end = "2027-05-16"
+
+[[trusted.anstyle-wincon]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2023-03-08"
+end = "2027-05-16"
+
+[[trusted.anyhow]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-10-05"
+end = "2027-05-23"
+
+[[trusted.async-trait]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-07-23"
+end = "2027-05-23"
+
+[[trusted.aws-lc-rs]]
+criteria = "safe-to-deploy"
+user-id = 156764 # Justin W Smith (justsmth)
+start = "2023-04-11"
+end = "2027-07-24"
+
+[[trusted.aws-lc-sys]]
+criteria = "safe-to-deploy"
+user-id = 156764 # Justin W Smith (justsmth)
+start = "2022-11-09"
+end = "2027-07-24"
+
+[[trusted.block-buffer]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:RustCrypto/utils"
+start = "2026-02-24"
+end = "2027-07-18"
+
+[[trusted.bytemuck]]
+criteria = "safe-to-deploy"
+user-id = 7211 # Lokathor (Lokathor)
+start = "2019-09-22"
+end = "2027-05-16"
+
+[[trusted.bytes]]
+criteria = "safe-to-deploy"
+user-id = 359 # Sean McArthur (seanmonstar)
+start = "2019-11-27"
+end = "2027-05-16"
+
+[[trusted.bytes]]
+criteria = "safe-to-deploy"
+user-id = 6741 # Alice Ryhl (Darksonn)
+start = "2021-01-11"
+end = "2027-06-20"
+
+[[trusted.chacha20]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:RustCrypto/stream-ciphers"
+start = "2026-02-06"
+end = "2027-07-18"
+
+[[trusted.clap]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2021-12-08"
+end = "2027-05-16"
+
+[[trusted.clap_builder]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2023-03-28"
+end = "2027-05-16"
+
+[[trusted.clap_derive]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2021-12-08"
+end = "2027-05-16"
+
+[[trusted.clap_lex]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2022-04-15"
+end = "2027-05-16"
+
+[[trusted.colorchoice]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2023-04-13"
+end = "2027-05-16"
+
+[[trusted.const-oid]]
+criteria = "safe-to-deploy"
+user-id = 267 # Tony Arcieri (tarcieri)
+start = "2020-08-04"
+end = "2027-07-18"
+
+[[trusted.crypto-common]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:RustCrypto/traits"
+start = "2026-02-04"
+end = "2027-07-18"
+
+[[trusted.digest]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:RustCrypto/traits"
+start = "2026-02-12"
+end = "2027-07-18"
+
+[[trusted.filetime]]
+criteria = "safe-to-deploy"
+user-id = 1 # Alex Crichton (alexcrichton)
+start = "2019-04-23"
+end = "2027-07-11"
+
+[[trusted.flate2]]
+criteria = "safe-to-deploy"
+user-id = 980 # Sebastian Thiel (Byron)
+start = "2023-08-15"
+end = "2027-04-11"
+
+[[trusted.futures-core]]
+criteria = "safe-to-deploy"
+user-id = 33035 # Taiki Endo (taiki-e)
+start = "2020-10-05"
+end = "2027-07-18"
+
+[[trusted.futures-macro]]
+criteria = "safe-to-deploy"
+user-id = 33035 # Taiki Endo (taiki-e)
+start = "2020-10-05"
+end = "2027-07-18"
+
+[[trusted.futures-sink]]
+criteria = "safe-to-deploy"
+user-id = 33035 # Taiki Endo (taiki-e)
+start = "2020-10-05"
+end = "2027-07-18"
+
+[[trusted.futures-task]]
+criteria = "safe-to-deploy"
+user-id = 33035 # Taiki Endo (taiki-e)
+start = "2019-07-29"
+end = "2027-07-18"
+
+[[trusted.futures-util]]
+criteria = "safe-to-deploy"
+user-id = 33035 # Taiki Endo (taiki-e)
+start = "2020-10-05"
+end = "2027-07-18"
+
+[[trusted.glob]]
+criteria = "safe-to-deploy"
+user-id = 55123 # rust-lang-owner
+start = "2023-01-06"
+end = "2027-07-25"
+
+[[trusted.http]]
+criteria = "safe-to-deploy"
+user-id = 359 # Sean McArthur (seanmonstar)
+start = "2019-04-05"
+end = "2027-05-16"
+
+[[trusted.http-body]]
+criteria = "safe-to-deploy"
+user-id = 359 # Sean McArthur (seanmonstar)
+start = "2019-10-01"
+end = "2027-09-13"
+
+[[trusted.http-body-util]]
+criteria = "safe-to-deploy"
+user-id = 359 # Sean McArthur (seanmonstar)
+start = "2022-10-25"
+end = "2027-05-16"
+
+[[trusted.httparse]]
+criteria = "safe-to-deploy"
+user-id = 359 # Sean McArthur (seanmonstar)
+start = "2019-07-03"
+end = "2027-05-16"
+
+[[trusted.hybrid-array]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:RustCrypto/hybrid-array"
+start = "2026-03-08"
+end = "2027-07-18"
+
+[[trusted.hyper]]
+criteria = "safe-to-deploy"
+user-id = 359 # Sean McArthur (seanmonstar)
+start = "2019-03-01"
+end = "2027-05-16"
+
+[[trusted.hyper-util]]
+criteria = "safe-to-deploy"
+user-id = 359 # Sean McArthur (seanmonstar)
+start = "2022-01-15"
+end = "2027-05-16"
+
+[[trusted.is_terminal_polyfill]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2024-05-02"
+end = "2027-05-16"
+
+[[trusted.itoa]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-05-02"
+end = "2027-05-23"
+
+[[trusted.libc]]
+criteria = "safe-to-deploy"
+user-id = 55123 # rust-lang-owner
+start = "2024-08-15"
+end = "2027-07-25"
+
+[[trusted.libc]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:rust-lang/libc"
+start = "2026-10-02"
+end = "2027-10-10"
+notes = "libc moved to crates.io trusted publishing with 0.2.190; the user-id trust entry for rust-lang-owner no longer matches its releases"
+
+[[trusted.memchr]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2019-07-07"
+end = "2027-05-16"
+
+[[trusted.mime]]
+criteria = "safe-to-deploy"
+user-id = 359 # Sean McArthur (seanmonstar)
+start = "2019-09-09"
+end = "2027-05-16"
+
+[[trusted.once_cell_polyfill]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2025-05-22"
+end = "2027-05-16"
+
+[[trusted.prettyplease]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2022-01-04"
+end = "2027-05-23"
+
+[[trusted.proc-macro2]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-04-23"
+end = "2027-07-25"
+
+[[trusted.quote]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-04-09"
+end = "2027-06-27"
+
+[[trusted.rand]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:rust-random/rand"
+start = "2026-01-26"
+end = "2027-07-18"
+
+[[trusted.rand_core]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:rust-random/rand_core"
+start = "2026-01-20"
+end = "2027-07-18"
+
+[[trusted.regex]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2019-02-27"
+end = "2027-05-16"
+
+[[trusted.regex-automata]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2019-02-25"
+end = "2027-05-16"
+
+[[trusted.regex-syntax]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2019-03-30"
+end = "2027-05-16"
+
+[[trusted.ryu]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-05-02"
+end = "2027-05-23"
+
+[[trusted.serde_json]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-02-28"
+end = "2027-05-23"
+
+[[trusted.serde_path_to_error]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-08-20"
+end = "2027-05-23"
+
+[[trusted.serde_spanned]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2023-01-20"
+end = "2027-05-16"
+
+[[trusted.sha1]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:RustCrypto/hashes"
+start = "2026-03-27"
+end = "2027-07-18"
+
+[[trusted.syn]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-03-01"
+end = "2027-05-23"
+
+[[trusted.tar]]
+criteria = "safe-to-deploy"
+user-id = 1 # Alex Crichton (alexcrichton)
+start = "2019-03-04"
+end = "2027-07-11"
+
+[[trusted.target-triple]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2023-12-21"
+end = "2027-05-23"
+
+[[trusted.target-tuple]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2026-09-08"
+end = "2027-09-13"
+
+[[trusted.thiserror]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-10-09"
+end = "2027-05-23"
+
+[[trusted.thiserror-impl]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-10-09"
+end = "2027-05-23"
+
+[[trusted.tokio]]
+criteria = "safe-to-deploy"
+user-id = 6741 # Alice Ryhl (Darksonn)
+start = "2020-12-25"
+end = "2027-07-18"
+
+[[trusted.tokio-tungstenite]]
+criteria = "safe-to-deploy"
+user-id = 96974 # Daniel Abramov (daniel-abramov)
+start = "2020-08-07"
+end = "2027-07-18"
+
+[[trusted.tokio-util]]
+criteria = "safe-to-deploy"
+user-id = 6741 # Alice Ryhl (Darksonn)
+start = "2021-01-12"
+end = "2027-09-05"
+
+[[trusted.toml]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2022-12-14"
+end = "2027-05-16"
+
+[[trusted.toml_datetime]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2022-10-21"
+end = "2027-05-16"
+
+[[trusted.toml_parser]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2025-07-08"
+end = "2027-05-16"
+
+[[trusted.toml_writer]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2025-07-08"
+end = "2027-05-16"
+
+[[trusted.tower]]
+criteria = "safe-to-deploy"
+user-id = 359 # Sean McArthur (seanmonstar)
+start = "2024-09-09"
+end = "2027-05-16"
+
+[[trusted.tower-http]]
+criteria = "safe-to-deploy"
+user-id = 359 # Sean McArthur (seanmonstar)
+start = "2024-09-23"
+end = "2027-05-16"
+
+[[trusted.trybuild]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-05-06"
+end = "2027-05-23"
+
+[[trusted.tungstenite]]
+criteria = "safe-to-deploy"
+user-id = 96974 # Daniel Abramov (daniel-abramov)
+start = "2020-08-07"
+end = "2027-07-18"
+
+[[trusted.unicase]]
+criteria = "safe-to-deploy"
+user-id = 359 # Sean McArthur (seanmonstar)
+start = "2019-03-05"
+end = "2027-09-05"
+
+[[trusted.unicode-ident]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2021-10-02"
+end = "2027-05-23"
+
+[[trusted.walkdir]]
+criteria = "safe-to-deploy"
+user-id = 189 # Andrew Gallant (BurntSushi)
+start = "2019-06-09"
+end = "2027-05-16"
+
+[[trusted.windows-sys]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2021-11-15"
+end = "2027-05-16"
+
+[[trusted.windows-targets]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2022-09-09"
+end = "2027-05-16"
+
+[[trusted.windows_aarch64_gnullvm]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2022-09-01"
+end = "2027-05-16"
+
+[[trusted.windows_aarch64_msvc]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2021-11-05"
+end = "2027-05-16"
+
+[[trusted.windows_i686_gnu]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2021-10-28"
+end = "2027-05-16"
+
+[[trusted.windows_i686_gnullvm]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2024-04-02"
+end = "2027-05-16"
+
+[[trusted.windows_i686_msvc]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2021-10-27"
+end = "2027-05-16"
+
+[[trusted.windows_x86_64_gnu]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2021-10-28"
+end = "2027-05-16"
+
+[[trusted.windows_x86_64_gnullvm]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2022-09-01"
+end = "2027-05-16"
+
+[[trusted.windows_x86_64_msvc]]
+criteria = "safe-to-deploy"
+user-id = 64539 # Kenny Kerr (kennykerr)
+start = "2021-10-27"
+end = "2027-05-16"
+
+[[trusted.winnow]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2023-02-22"
+end = "2027-05-16"
+
+[[trusted.zmij]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2025-12-18"
+end = "2027-05-23"

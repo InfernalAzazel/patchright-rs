@@ -1,0 +1,162 @@
+# cargo-mutants configuration
+# Run with: cargo mutants
+# See: https://mutants.rs/config.html
+
+# nextest reports a hung test as TIMEOUT the same way the test job does,
+# and with --fail-fast below it stops at the first test that kills a mutant.
+test_tool = "nextest"
+
+# Only the files with unit-test coverage. Most of this crate is RPC
+# delegation that only a live browser exercises; a directory glob would
+# turn every such method into a MISSED that nothing but the integration
+# suite could kill, and that suite is far too slow to run per mutant.
+examine_globs = [
+    "crates/playwright/src/protocol/event_registry.rs",
+    "crates/playwright/src/protocol/locator.rs",
+    "crates/playwright/src/protocol/evaluate_conversion.rs",
+    "crates/playwright/src/protocol/glob.rs",
+    "crates/playwright/src/protocol/action_options.rs",
+    "crates/playwright/src/protocol/click.rs",
+    "crates/playwright/src/protocol/screenshot.rs",
+    "crates/playwright/src/protocol/drop_options.rs",
+    "crates/playwright/src/protocol/har_options.rs",
+    "crates/playwright/src/protocol/select_option.rs",
+    "crates/playwright/src/api/launch_options.rs",
+    "crates/playwright/src/protocol/tap.rs",
+    "crates/playwright/src/protocol/drag_to.rs",
+    "crates/playwright/src/protocol/wait_for.rs",
+    "crates/playwright/src/server/error_parsing.rs",
+    "crates/playwright/src/server/driver.rs",
+    "crates/playwright/src/protocol/route_params.rs",
+    "crates/playwright/src/protocol/route_service.rs",
+    "crates/playwright/src/protocol/resource_timing.rs",
+    "crates/playwright/src/protocol/page/mod.rs",
+    "crates/playwright/src/protocol/browser_context/events.rs",
+    "crates/playwright/src/protocol/in_flight.rs",
+]
+
+# The unit tests plus every test binary that runs without a browser. The
+# browser suites (`integration`, `sigint_termios`) are left out by target
+# rather than by nextest filter because cargo would otherwise relink them
+# for every mutant. A new browser-free test binary has to be added here or
+# its kills are never counted; `tests/properties.rs` sat outside this list
+# for months; scripts/check-mutants-test-targets.sh now fails the commit
+# instead.
+additional_cargo_test_args = [
+    # The default profile keeps every failure visible; per mutant the first
+    # kill is all that matters.
+    "--fail-fast",
+    "--lib",
+    "--test", "browser_context_proxy_test",
+    "--test", "browser_context_serialization_test",
+    "--test", "browser_install_error_test",
+    "--test", "file_payload_test",
+    "--test", "playwright_version_test",
+    "--test", "properties",
+]
+
+# Exclude mutations that are only testable via integration tests (require Playwright server)
+# or represent serde_json limitations (cannot distinguish special float behavior).
+exclude_re = [
+    # driver.rs: the pure helpers (install_args, tee) and the env-override
+    # resolution (resolve_driver, try_driver_path_env, try_node_cli_env, which
+    # take an environment lookup and are tested against a tempdir) are
+    # unit-testable; everything that reads compile-time paths, the user cache,
+    # npm, or spawns the driver needs integration tests. Mutant names are
+    # "<path>:<line>:<col>: replace <fn> -> ..." with no `fn ` keyword and no
+    # module path, so these match the bare function name — verify edits with
+    # `cargo mutants --list -f crates/playwright/src/server/driver.rs`.
+    "install_browsers",
+    "get_driver_executable",
+    "try_bundled_driver|try_user_cache_driver",
+    "try_npm_global|try_npm_local",
+    "find_playwright_in_node_modules|find_node_executable",
+
+    # page/mod.rs: LocatorHandlerEntry::take_invocation is pure and unit
+    # tested; the timeout notifier talks to the server and the Debug impl is
+    # display-only.
+    "set_timeout_and_notify",
+    "impl std::fmt::Debug for Page",
+
+    # browser_context/events.rs: the forwarding, bridging and waiter-drain
+    # helpers are pure and unit tested; every BrowserContext method there
+    # talks to the server or a live page, as does Forwarders::wire.
+    "BrowserContext::",
+    "Forwarders::wire",
+
+    # route_service.rs: the request/response conversions are pure and unit
+    # tested; the fulfiller, its inner step, and the engine lookup drive a
+    # live Route and need the integration suite.
+    "fulfill_from_service|service_response|request_context",
+
+    # Builder constructors — trivially correct, integration-test-only
+    "Options::builder",
+    "ScreenshotOptions::builder",
+
+    # Locator methods that delegate to Frame RPC — only testable with Playwright server
+    "Locator::count",
+    "Locator::all ",
+    "Locator::text_content",
+    "Locator::inner_text",
+    "Locator::inner_html",
+    "Locator::get_attribute",
+    "Locator::input_value",
+    "Locator::is_visible",
+    "Locator::is_enabled",
+    "Locator::is_checked",
+    "Locator::is_editable",
+    "Locator::is_hidden",
+    "Locator::is_disabled",
+    "Locator::is_focused",
+    "Locator::click",
+    "Locator::dblclick",
+    "Locator::fill",
+    "Locator::clear",
+    "Locator::press ",
+    "Locator::check",
+    "Locator::uncheck",
+    "Locator::set_checked",
+    "Locator::hover",
+    "Locator::select_option",
+    "Locator::set_input_files",
+    "Locator::screenshot",
+    "Locator::evaluate_js",
+    "Locator::focus",
+    "Locator::blur",
+    "Locator::press_sequentially",
+    "Locator::all_inner_texts",
+    "Locator::all_text_contents",
+    "Locator::dispatch_event",
+    "Locator::bounding_box",
+    "Locator::scroll_into_view_if_needed",
+    "Locator::tap",
+    "Locator::evaluate",
+    "Locator::evaluate_all",
+    "Locator::drag_to",
+    "Locator::drop",
+    "Locator::with_timeout",
+    "Locator::wait_for",
+    "Locator::aria_snapshot",
+    "Locator::highlight",
+    "Locator::selector",
+    "Locator::mask_json",
+    "Locator::wrap_error",
+    "impl std::fmt::Debug for Locator",
+
+    # Fluent builder setters — trivially correct, integration-test-only
+    "LaunchOptions::.* -> Self",
+    "OptionsBuilder::.* -> Self",
+
+    # PressSequentiallyOptions — only exercised by integration tests
+    "PressSequentiallyOptions",
+
+    # FilterOptions::has / has_not take a Locator, which needs a live Frame —
+    # only constructible in integration tests
+    "FilterOptions::has ",
+    "FilterOptions::has_not ",
+
+    # serde_json cannot represent Infinity/NaN/-0, match arms are indistinguishable
+    "delete match arm .*(Infinity|NaN|null.*undefined|ui8)",
+    "replace == with != in serialize_value",
+    "delete - in parse_value",
+]
