@@ -120,6 +120,7 @@ fn main() {
     patch_driver_download_module();
     patch_runtime_download();
     patch_launch_uses_ensure_driver();
+    patch_changelog();
 }
 
 /// `evaluate` / `evaluate_handle` / `evaluate_all` run in an isolated world
@@ -735,5 +736,23 @@ fn patch_launch_uses_ensure_driver() {
         server,
         "        // Get the driver executable paths\n        // The driver should already be downloaded by build.rs\n        let (node_exe, cli_js) = get_driver_executable()?;",
         "        // Resolve the driver, assembling one into this machine's user cache\n        // if there is none: build.rs only ever ran on the build machine.\n        let (node_exe, cli_js) = ensure_driver().await?;",
+    );
+}
+
+/// Record the behaviour change where a consumer looks for it.
+fn patch_changelog() {
+    insert_after(
+        &format!("{CRATE}/CHANGELOG.md"),
+        "## [Unreleased]\n",
+        r#"
+### Added
+
+- **`ensure_driver`: the driver is assembled on the machine that runs it, when that machine has none.** The build script assembles the driver at compile time and records the *builder's* cache path, which is the wrong machine for anyone who receives a built binary: the recorded path names the builder, the user cache is empty there, and every launch fails with `Error::ServerNotFound`. `PlaywrightServer::launch` now calls `ensure_driver`, which resolves exactly as before and, only when nothing is found at all, assembles the driver into this machine's user cache — the same directory the resolution chain already probes, so no environment variable has to be set. Behind the new `driver-download` feature, on by default because the consumers this exists for bracket the crate with default features. A `PLAYWRIGHT_DRIVER_PATH` that is set but wrong still fails as `Error::DriverMisconfigured` rather than being papered over, and `PLAYWRIGHT_SKIP_DRIVER_DOWNLOAD` turns the runtime download off for a host that must not reach the network. A download that was attempted and failed is its own error, `Error::DriverDownloadFailed`, whose message names the failure and repeats the ways to provide a driver.
+- **`PLAYWRIGHT_SKIP_DRIVER_DOWNLOAD` now applies at runtime too.** It was a build-time knob; a process that has it set assembles nothing either, which is what a compile-only job or an offline host needs. A build machine and the machine that runs the binary are different processes, so a build that skipped the download can still ship a binary that fetches a driver on first launch.
+
+### Changed
+
+- **A machine with no driver now reaches the network on first launch.** Up to ~100 MB (a Node runtime and the `patchright-core` tarball) is fetched once per machine and cached under the user cache directory. The download runs off a tokio worker (`spawn_blocking`), and an assembly that fails leaves the launch failing as it did before, with the reason attached.
+"#,
     );
 }
