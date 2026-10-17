@@ -1,0 +1,50 @@
+# Nextest configuration for playwright-rust
+# See: https://nexte.st/docs/configuration/
+
+[store]
+dir = "target/nextest"
+
+[profile.default]
+# A hung browser or driver fails the test in a minute instead of holding
+# the run open. terminate-after counts periods: SIGTERM after the second.
+slow-timeout = { period = "30s", terminate-after = 2 }
+fail-fast = false
+# Browser/driver processes can take longer than nextest's 100ms default to be
+# reaped after a test ends; without this, an otherwise-passing test is
+# intermittently flagged "leaky" and fails the run (and the pre-commit hook).
+leak-timeout = "1s"
+# No retries here: a test that fails one run in three is a bug to look at,
+# not a flake to paper over.
+
+[profile.ci]
+# One retry, so a single environmental hiccup does not fail a whole run.
+# The cost is that a flaky test then exits 0 and the job goes green, so
+# `scripts/report-flaky-tests.sh` reads the run's log and puts the names
+# in the job summary. Record each one in the flaky-test tracking issue
+# and harden it when it recurs.
+retries = 1
+slow-timeout = { period = "60s", terminate-after = 2 }
+fail-fast = false
+leak-timeout = "1s"
+
+# Overrides on the default profile apply to every profile, so each filter is
+# written once and the ci profile inherits it.
+
+# Cross-browser tests launch Firefox/WebKit, which are slow to start
+# (especially on Windows).
+[[profile.default.overrides]]
+filter = "test(/cross_browser/) | test(/firefox/) | test(/webkit/)"
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+# Each CLI installer test downloads a whole driver into an empty HOME,
+# which is the thing being tested, so it is not comparable to a test that
+# talks to an already-installed one. The ci profile would kill it at 120s
+# and the report would read as an installer hang rather than a slow CDN.
+[[profile.default.overrides]]
+filter = "test(cli_bin)"
+slow-timeout = { period = "120s", terminate-after = 5 }
+
+# Stress tests run dozens of launch/close cycles.
+[[profile.default.overrides]]
+filter = "test(/test_no_memory_leak/) | test(test_rapid_browser) | test(test_file_descriptor) | test(test_resource_limit_stress) | test(test_concurrent_browser_cleanup) | test(test_multiple_server_cycles) | test(test_error_recovery_stress)"
+slow-timeout = { period = "60s", terminate-after = 2 }

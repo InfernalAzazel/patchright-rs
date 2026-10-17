@@ -1,0 +1,18 @@
+[build]
+target = "index.html"
+# Served at the apex of the custom domain (playwright-rust.dev), so the public
+# URL is the site root.
+public_url = "/"
+
+[tools]
+# Pin the Tailwind v4 standalone binary (Trunk defaults to a v3 release, which
+# can't parse our v4 `@import "tailwindcss"` / `@theme` input.css).
+tailwindcss = "4.3.0"
+
+[watch]
+# `copy-dir` re-copies public/receipts and public/architecture into dist on
+# every build. Without ignoring the generated files (and the dist output), the
+# file watcher sees that and retriggers the build, looping forever under
+# `trunk serve`. Both are generated artifacts, not source, so never watch
+# them; the copy-dir still runs at build time.
+ignore = ["public/receipts", "public/architecture", "dist"]
